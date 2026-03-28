@@ -1,17 +1,37 @@
 [package]
-name = "secrets"
-version = "0.1.0"
+name = "secrets-vault"
+version = "1.0.0"
 edition = "2021"
+description = "AES-256-GCM encrypted key-value vault with PBKDF2 key derivation"
+license = "MIT"
+repository = "https://github.com/quantum-encoding/secrets"
+keywords = ["encryption", "secrets", "vault", "aes-gcm", "security"]
+categories = ["cryptography", "command-line-utilities"]
+
+[lib]
+name = "secrets_vault"
+path = "src/lib.rs"
+
+[[bin]]
+name = "secrets"
+path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+# Core crypto (required by library)
 aes-gcm = "0.10"
 pbkdf2 = "0.12"
 sha2 = "0.10"
-rpassword = "7.0"
 zeroize = "1.6"
-dirs = "5.0"
-atty = "0.2"
+
+# CLI only
+clap = { version = "4", features = ["derive"], optional = true }
+rpassword = { version = "7.0", optional = true }
+dirs = { version = "5.0", optional = true }
+atty = { version = "0.2", optional = true }
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:rpassword", "dep:dirs", "dep:atty"]
 
 [profile.release]
 opt-level = "z"

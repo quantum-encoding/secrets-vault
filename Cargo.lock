@@ -415,8 +415,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "secrets"
-version = "0.1.0"
+name = "secrets-vault"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "atty",
