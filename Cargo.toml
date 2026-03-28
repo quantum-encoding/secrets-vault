@@ -2,11 +2,16 @@
 name = "secrets-vault"
 version = "1.0.0"
 edition = "2021"
-description = "AES-256-GCM encrypted key-value vault with PBKDF2 key derivation"
+rust-version = "1.70"
+description = "AES-256-GCM encrypted key-value vault with PBKDF2 key derivation. Store API keys and tokens securely instead of plaintext dotfiles."
 license = "MIT"
-repository = "https://github.com/quantum-encoding/secrets"
+repository = "https://github.com/quantum-encoding/secrets-vault"
+homepage = "https://github.com/quantum-encoding/secrets-vault"
+documentation = "https://docs.rs/secrets-vault"
+readme = "README.md"
 keywords = ["encryption", "secrets", "vault", "aes-gcm", "security"]
 categories = ["cryptography", "command-line-utilities"]
+exclude = ["target/", ".DS_Store"]
 
 [lib]
 name = "secrets_vault"
@@ -15,15 +20,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "secrets"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
-# Core crypto (required by library)
+# Core crypto (library only — 4 deps, all pure Rust)
 aes-gcm = "0.10"
 pbkdf2 = "0.12"
 sha2 = "0.10"
 zeroize = "1.6"
 
-# CLI only
+# CLI binary (optional)
 clap = { version = "4", features = ["derive"], optional = true }
 rpassword = { version = "7.0", optional = true }
 dirs = { version = "5.0", optional = true }
