@@ -1,0 +1,20 @@
+[package]
+name = "secrets"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+aes-gcm = "0.10"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+rpassword = "7.0"
+zeroize = "1.6"
+dirs = "5.0"
+atty = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
