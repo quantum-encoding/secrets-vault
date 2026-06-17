@@ -72,7 +72,13 @@ enum Commands {
     /// Export all as KEY=VALUE
     Export,
     /// Store the vault passphrase in the biometric Keychain (Touch ID on read)
-    Unlock,
+    Unlock {
+        /// Strict mode: enrolled biometry ONLY (no watch/passcode fallback),
+        /// self-invalidates on fingerprint change, and forces a FRESH tap on every
+        /// read (no grace window). Trades convenience for max security.
+        #[arg(long)]
+        strict: bool,
+    },
     /// Remove the biometric Keychain entry (re-lock)
     Lock,
     /// Run a command with ONLY a project's secrets in its environment.
@@ -184,11 +190,22 @@ fn load_manifest(project: &str) -> Result<(Vec<String>, Option<gsm::GsmConfig>),
 /// until the human taps — verified) → TTY prompt if we have a terminal → else fail
 /// closed. Note: a single read here covers a whole `exec` batch (all keys decrypt in
 /// one vault-open after this), so an exec does exactly ONE keychain read.
+/// Marker file recording that the Keychain item was stored in strict mode, so
+/// reads attach a zero-reuse LAContext. The item's own ACL (BiometryCurrentSet) is
+/// the hard enforcement — this only controls the read-side reuse behavior.
+fn strict_marker_path() -> PathBuf {
+    secrets_dir().join("strict")
+}
+
+fn is_strict_mode() -> bool {
+    strict_marker_path().exists()
+}
+
 fn get_passphrase() -> Zeroizing<String> {
     if let Ok(pass) = env::var("SECRETS_PASSPHRASE") {
         return Zeroizing::new(pass);
     }
-    match keychain::read("Unlock your secrets vault") {
+    match keychain::read("Unlock your secrets vault", is_strict_mode()) {
         Ok(Some(p)) => return Zeroizing::new(p),
         Ok(None) => {} // no Keychain item yet (run `secrets unlock`)
         Err(e) => eprintln!("(keychain unavailable: {e})"),
@@ -586,7 +603,7 @@ fn main() {
             }
         }
 
-        Commands::Unlock => {
+        Commands::Unlock { strict } => {
             let pass = prompt_only_passphrase();
             // If a vault already exists, verify the passphrase decrypts it before
             // storing — don't lock in a wrong passphrase.
@@ -596,10 +613,25 @@ fn main() {
                     process::exit(1);
                 }
             }
-            match keychain::store(&pass) {
-                Ok(()) => eprintln!(
-                    "Unlocked. Master key stored in the biometric Keychain — Touch ID required on read."
-                ),
+            match keychain::store(&pass, strict) {
+                Ok(()) => {
+                    // Persist (or clear) the strict marker so reads match the ACL.
+                    let marker = strict_marker_path();
+                    if strict {
+                        if let Some(parent) = marker.parent() {
+                            fs::create_dir_all(parent).ok();
+                        }
+                        let _ = fs::write(&marker, b"1");
+                        eprintln!(
+                            "Unlocked (STRICT). Enrolled biometry only, no reuse — a fresh Touch ID tap is required on every access."
+                        );
+                    } else {
+                        let _ = fs::remove_file(&marker);
+                        eprintln!(
+                            "Unlocked. Master key stored in the biometric Keychain — Touch ID required on read (with the system reuse grace)."
+                        );
+                    }
+                }
                 Err(e) => {
                     eprintln!("Keychain store failed: {e}");
                     process::exit(1);
@@ -608,7 +640,10 @@ fn main() {
         }
 
         Commands::Lock => match keychain::delete() {
-            Ok(()) => eprintln!("Locked. Biometric Keychain entry removed."),
+            Ok(()) => {
+                let _ = fs::remove_file(strict_marker_path());
+                eprintln!("Locked. Biometric Keychain entry removed.");
+            }
             Err(e) => {
                 eprintln!("Keychain delete failed: {e}");
                 process::exit(1);

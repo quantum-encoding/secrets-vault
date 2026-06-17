@@ -60,6 +60,7 @@ echo 'eval $(secrets env 2>/dev/null)' >> ~/.zshrc
 
 ```
 secrets set KEY [VALUE]   Store a secret (prompts with hidden input if no value)
+secrets gen KEY           Generate a random secret and store it — value NEVER printed
 secrets get KEY           Retrieve a secret (stdout, no trailing newline)
 secrets delete KEY        Remove a secret
 secrets list              List all key names (sorted)
@@ -68,6 +69,14 @@ secrets env --json        Output as JSON object
 secrets import            Import KEY=VALUE lines from stdin
 secrets export            Export all as KEY=VALUE
 secrets --version         Show version
+
+# macOS — biometric vault + agent-safe scoped injection (see section below)
+secrets unlock [--strict] Store the master key in the biometric Keychain (Touch ID)
+secrets lock              Remove the biometric Keychain entry
+secrets exec P -- CMD     Run CMD with ONLY project P's secrets in its environment
+secrets authorize A P     Grant agent A access to project P (Touch ID)
+secrets revoke A P        Revoke an agent's access to a project (Touch ID)
+secrets list-projects     Show registered projects + agent grants (Touch ID)
 ```
 
 ### Bulk import from existing shell config
@@ -90,6 +99,105 @@ The vault passphrase can be provided three ways:
    # Then in .zshrc:
    eval $(SECRETS_PASSPHRASE="$(security find-generic-password -s secrets-vault-passphrase -w 2>/dev/null)" secrets env 2>/dev/null)
    ```
+
+## Agent-Safe Secrets: biometric vault + scoped `exec` (macOS)
+
+> `eval $(secrets env)` dumps your **entire** vault into the shell environment, where
+> every child process — including untrusted `npm`/`pip` postinstall scripts and AI
+> coding agents — inherits all of it. The features below replace that footgun with a
+> biometric-gated vault and **per-project, child-only** secret injection.
+
+### 1. Biometric unlock (Touch ID / Secure Enclave)
+
+```bash
+secrets unlock            # type the vault passphrase once → stored behind Touch ID
+```
+
+The master passphrase lives in a data-protection Keychain item in a **team-prefixed
+access group**, protected by a `SecAccessControl`. Only this Developer-ID-signed
+binary can reach it, and only after a Touch ID tap — a background `evilpackage`
+running `security find-generic-password` gets nothing. After `unlock`, every read
+surfaces the native Touch ID sheet **even from a headless/agent process** (it routes
+to your display and blocks until you tap). `secrets lock` removes the item.
+
+### 2. Scoped execution — `secrets exec`
+
+Declare which secrets a project needs in a `.secrets.toml` manifest (names only —
+values stay in the vault), then run a command with **only** those keys in its
+environment, injected at spawn and visible to **no other process**:
+
+```toml
+# .secrets.toml  (in your project root)
+[projects.myapp]
+secrets = ["DATABASE_URL", "STRIPE_SECRET_KEY"]
+```
+
+```bash
+secrets exec myapp -- cargo run
+# → one Touch ID tap, decrypts ONLY those keys, injects into cargo's env, zeroizes.
+```
+
+`exec` does exactly **one** Keychain read and decrypts the whole batch in a single
+vault-open, then wipes the plaintext from its own memory before the child starts.
+
+### 3. Generate without scrollback exposure
+
+```bash
+secrets gen SESSION_TOKEN           # 32 random bytes → stored; value never printed
+secrets gen API_KEY --bytes 64      # custom length
+```
+
+### 4. Agent authorization (who may use what)
+
+When a recognized AI agent (Claude, etc.) drives `secrets exec`, the CLI resolves the
+calling agent from the process ancestry and requires an explicit grant:
+
+```bash
+secrets authorize claude myapp                       # permanent grant (Touch ID)
+secrets authorize claude myapp --session-minutes 15  # timed grant
+secrets revoke    claude myapp
+secrets list-projects                                # inspect grants
+```
+
+Grants are stored in an **encrypted, biometric-gated registry** (`registry.enc`) —
+metadata only, never secret values. An ungranted agent fails closed (or requests
+real-time approval via the **aiconductor** desktop app — see `APPROVAL_PROTOCOL.md`).
+Process-ancestry agent ID is a *soft* layer (spoofable by a same-user adversary); the
+hard boundary is the Touch ID tap.
+
+### 5. Google Secret Manager backend
+
+Point a project at GSM and values are pulled live from Secret Manager (via `gcloud`,
+never the local vault). Secret values transit `gcloud` stdin/stdout — never argv.
+
+```toml
+# .secrets.toml
+[gsm]
+project = "my-gcp-project"          # acting identity needs secretAccessor / secretVersionAdder
+secrets = ["DATABASE_URL", "API_KEY"]
+```
+
+```bash
+secrets set  API_KEY "value" --gsm --project my-gcp-project   # write to GSM
+secrets gen  API_KEY         --gsm --project my-gcp-project   # generate → GSM
+secrets exec myapp -- ./deploy.sh                              # exec pulls from GSM
+```
+
+### 6. Strict mode — close the Touch ID grace window
+
+A normal (`UserPresence`) unlock honors macOS's **system Touch ID reuse grace**: after
+one tap, a burst of reads flows without re-prompting (convenient for agent runs, but a
+concurrent malicious read could ride that window). Strict mode trades that for a fresh
+tap on every access:
+
+```bash
+secrets unlock --strict
+```
+
+This stores the item with `BiometryCurrentSet` (enrolled biometry **only** — no
+watch/passcode fallback; self-invalidates if the fingerprint set changes) and attaches
+a zero-reuse `LAContext` (`touchIDAuthenticationAllowableReuseDuration = 0`) on every
+read. Re-run plain `secrets unlock` to return to the convenient mode.
 
 ## Library Usage
 
@@ -217,8 +325,12 @@ This format is binary-compatible with the [Zig implementation](https://github.co
 
 | Variable | Description |
 |----------|------------|
-| `SECRETS_PASSPHRASE` | Vault passphrase for non-interactive use |
+| `SECRETS_PASSPHRASE` | Vault passphrase for non-interactive use (bypasses Keychain) |
 | `SECRETS_DIR` | Override vault directory (default: `~/.config/secrets`) |
+| `SECRETS_GSM_ACCOUNT` | Override the active `gcloud` account for the GSM backend |
+| `SECRETS_GSM_IMPERSONATE` | Service account to impersonate for GSM access |
+| `SECRETS_APPROVAL_DIR` | Approval handshake dir (default: `~/.secrets/pending_approvals`) |
+| `SECRETS_APPROVAL_TIMEOUT_SECS` | Real-time approval wait before failing closed (default: 30) |
 
 ## Comparison
 
