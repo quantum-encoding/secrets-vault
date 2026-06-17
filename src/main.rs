@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::{env, fs, process};
 
 use clap::{Parser, Subcommand};
@@ -40,6 +41,15 @@ enum Commands {
     Unlock,
     /// Remove the biometric Keychain entry (re-lock)
     Lock,
+    /// Run a command with ONLY a project's secrets in its environment.
+    ///   secrets exec <project> -- <command> [args...]
+    Exec {
+        /// Project name — selects the secret list from .secrets.toml
+        project: String,
+        /// Command and arguments (everything after `--`)
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
 }
 
 fn vault_path() -> std::path::PathBuf {
@@ -51,6 +61,52 @@ fn vault_path() -> std::path::PathBuf {
         .join(".config")
         .join("secrets")
         .join("vault.qvlt")
+}
+
+fn secrets_dir() -> PathBuf {
+    if let Ok(dir) = env::var("SECRETS_DIR") {
+        return PathBuf::from(dir);
+    }
+    dirs::home_dir()
+        .expect("HOME not set")
+        .join(".config")
+        .join("secrets")
+}
+
+/// Resolve the secret NAMES a project needs from `.secrets.toml` (current dir)
+/// or the global `<secrets-dir>/projects.toml`. Supports both
+/// `[projects.<name>] secrets = [...]` and a flat top-level `secrets = [...]`.
+/// Names only ever leave the manifest — values stay in the encrypted vault.
+fn resolve_project_secrets(project: &str) -> Result<Vec<String>, String> {
+    let candidates = [PathBuf::from(".secrets.toml"), secrets_dir().join("projects.toml")];
+    let path = candidates.iter().find(|p| p.exists()).ok_or_else(|| {
+        "no .secrets.toml in this directory (or projects.toml in your secrets dir)".to_string()
+    })?;
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let table: toml::Table = content
+        .parse()
+        .map_err(|e| format!("invalid TOML in {}: {e}", path.display()))?;
+
+    let arr = table
+        .get("projects")
+        .and_then(|p| p.get(project))
+        .and_then(|s| s.get("secrets"))
+        .or_else(|| table.get("secrets"))
+        .ok_or_else(|| {
+            format!("no secret list for '{project}' (expected [projects.{project}].secrets or a top-level secrets = [...])")
+        })?;
+
+    let names: Vec<String> = arr
+        .as_array()
+        .ok_or_else(|| "`secrets` must be an array of names".to_string())?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if names.is_empty() {
+        return Err(format!("project '{project}' lists no secrets"));
+    }
+    Ok(names)
 }
 
 fn get_passphrase() -> Zeroizing<String> {
@@ -267,5 +323,72 @@ fn main() {
                 process::exit(1);
             }
         },
+
+        Commands::Exec { project, command } => {
+            if command.is_empty() {
+                eprintln!("Usage: secrets exec <project> -- <command> [args...]");
+                process::exit(2);
+            }
+            let names = resolve_project_secrets(&project).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+
+            // One Touch ID prompt here (load_vault → keychain). The master
+            // passphrase is dropped (zeroized) immediately via the `_`.
+            let (vault, _) = load_vault();
+
+            let mut cmd = process::Command::new(&command[0]);
+            cmd.args(&command[1..]);
+            // Never let the child inherit the master key, whatever the parent env.
+            cmd.env_remove("SECRETS_PASSPHRASE");
+
+            let mut injected = 0usize;
+            let mut missing: Vec<&str> = Vec::new();
+            for name in &names {
+                match vault.get(name) {
+                    Some(value) => {
+                        cmd.env(name, value); // injected into ONLY the child's env
+                        injected += 1;
+                    }
+                    None => missing.push(name.as_str()),
+                }
+            }
+            if !missing.is_empty() {
+                eprintln!("warning: not in vault, skipped: {}", missing.join(", "));
+            }
+            eprintln!(
+                "secrets exec: injecting {injected} secret(s) into `{}` (project: {project})",
+                command[0]
+            );
+
+            let mut child = cmd.spawn().unwrap_or_else(|e| {
+                eprintln!("Failed to spawn `{}`: {e}", command[0]);
+                process::exit(127);
+            });
+
+            // The child holds its own env copy now — zeroize the vault plaintext
+            // (and master key, already dropped) in OUR RAM immediately.
+            drop(vault);
+
+            let status = child.wait().unwrap_or_else(|e| {
+                eprintln!("Failed waiting for child: {e}");
+                process::exit(1);
+            });
+
+            // Forward the child's exact exit code so CI/scripts see the real
+            // result (signal → 128 + signo, matching shell convention).
+            #[cfg(unix)]
+            let code = {
+                use std::os::unix::process::ExitStatusExt;
+                status
+                    .code()
+                    .or_else(|| status.signal().map(|s| 128 + s))
+                    .unwrap_or(1)
+            };
+            #[cfg(not(unix))]
+            let code = status.code().unwrap_or(1);
+            process::exit(code);
+        }
     }
 }

@@ -34,10 +34,11 @@ clap = { version = "4", features = ["derive"], optional = true }
 rpassword = { version = "7.0", optional = true }
 dirs = { version = "5.0", optional = true }
 atty = { version = "0.2", optional = true }
+toml = { version = "0.8", optional = true }   # .secrets.toml project manifest (exec)
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:rpassword", "dep:dirs", "dep:atty"]
+cli = ["dep:clap", "dep:rpassword", "dep:dirs", "dep:atty", "dep:toml"]
 
 # macOS biometric Keychain (Touch ID) — the master key lives in the Secure
 # Enclave instead of an env var, gated by the access group in secrets.entitlements.
