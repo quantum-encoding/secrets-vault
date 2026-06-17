@@ -1,5 +1,6 @@
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use std::{env, fs, process};
 
 use clap::{Parser, Subcommand};
@@ -283,50 +284,78 @@ fn load_vault_with(passphrase: &str) -> Vault {
     }
 }
 
-enum Approval {
-    Once,
-    Session,
-    Always,
-    Deny,
-    NonInteractive,
+/// Directory both `secrets` and `aiconductor` use for the approval handshake.
+/// A plain same-user dir (no App Group entitlement / provisioning profile).
+/// COORDINATION: aiconductor must watch this same path.
+fn approval_dir() -> PathBuf {
+    if let Ok(d) = env::var("SECRETS_APPROVAL_DIR") {
+        return PathBuf::from(d);
+    }
+    dirs::home_dir()
+        .expect("HOME not set")
+        .join(".secrets")
+        .join("pending_approvals")
 }
 
-/// Present the 4-option approval reading ONLY from the controlling terminal
-/// (`/dev/tty`) — never stdin — so an agent that owns our stdin can't pipe a fake
-/// answer. If `/dev/tty` can't be opened (unattended/agent context), returns
-/// NonInteractive so the caller fails closed.
-fn approval_prompt(agent: &str, project: &str, keys: &[String], cmd: &str) -> Approval {
-    use std::io::{BufRead, BufReader, Write};
-    let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
-        Ok(t) => t,
-        Err(_) => return Approval::NonInteractive,
-    };
-    let mut w = match tty.try_clone() {
-        Ok(t) => t,
-        Err(_) => return Approval::NonInteractive,
-    };
-    let _ = write!(
-        w,
-        "\n🔐  {agent}  wants  {k}\n    from project  {project}\n    to pipe into  {cmd}\n\n\
-         \x20 [1] Allow once          (Touch ID each time — most secure)\n\
-         \x20 [2] Allow this session  (15 min — any local process can reuse)\n\
-         \x20 [3] Always allow        (permanent — un-gated until you revoke)\n\
-         \x20 [4] Deny\n\n\
-         \x20 choice [1-4]: ",
-        k = keys.join(", ")
-    );
-    let _ = w.flush();
-    let mut line = String::new();
-    let mut r = BufReader::new(tty);
-    if r.read_line(&mut line).is_err() {
-        return Approval::Deny;
+/// Request real-time approval via aiconductor and return whether a valid grant
+/// now exists. SECURITY: the `[id]_response.json` file is an UNTRUSTED "re-check"
+/// signal — a same-user agent could forge it. The approval is real ONLY if a
+/// grant now appears in the encrypted `registry.enc`, which only aiconductor (with
+/// the human's biometric) can write. We re-read the registry with the passphrase
+/// we already hold — no second CLI prompt.
+fn ipc_approval(
+    agent: &str,
+    project: &str,
+    command: &str,
+    keys: &[String],
+    reg_dir: &Path,
+    passphrase: &str,
+) -> bool {
+    let dir = approval_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        eprintln!("Could not create approval dir {}", dir.display());
+        return false;
     }
-    match line.trim() {
-        "1" => Approval::Once,
-        "2" => Approval::Session,
-        "3" => Approval::Always,
-        _ => Approval::Deny,
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     }
+
+    let id = to_hex(&random_bytes(16));
+    let req_path = dir.join(format!("{id}.json"));
+    let resp_path = dir.join(format!("{id}_response.json"));
+
+    let req = serde_json::json!({
+        "id": id, "agent": agent, "project": project, "command": command, "keys": keys,
+    });
+    if fs::write(&req_path, serde_json::to_vec_pretty(&req).unwrap_or_default()).is_err() {
+        eprintln!("Could not write approval request.");
+        return false;
+    }
+
+    eprintln!("Waiting for approval in aiconductor… ({agent} → {project})");
+    let timeout = env::var("SECRETS_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30);
+    let start = Instant::now();
+    let granted = loop {
+        if resp_path.exists() {
+            // Untrusted signal → re-read the encrypted registry (the real boundary).
+            let reg = registry::Registry::load(reg_dir, passphrase).unwrap_or_default();
+            break reg.grant_for(agent, project, registry::now()).is_some();
+        }
+        if start.elapsed().as_secs() >= timeout {
+            eprintln!("Approval timed out (is aiconductor running?).");
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let _ = fs::remove_file(&req_path);
+    let _ = fs::remove_file(&resp_path);
+    granted
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -512,40 +541,22 @@ fn main() {
             // and the vault (no double prompt).
             let pass = get_passphrase();
             let dir = secrets_dir();
-            let mut reg = registry::Registry::load(&dir, &pass).unwrap_or_else(|e| {
+            let reg = registry::Registry::load(&dir, &pass).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 process::exit(1);
             });
 
-            // Enforcement: a recognized agent must hold a valid grant — or get one
-            // via the /dev/tty prompt. A human / unrecognized caller who already
-            // satisfied Touch ID is the operator and proceeds.
+            // Enforcement: a recognized agent must hold a valid grant — or earn one
+            // via real-time approval in aiconductor (registry-anchored, NOT the
+            // forgeable response file). A human / unrecognized operator who already
+            // satisfied Touch ID proceeds.
             if let Some(agent) = registry::resolve_agent() {
-                if reg.grant_for(&agent, &project, registry::now()).is_none() {
-                    match approval_prompt(&agent, &project, &names, &command[0]) {
-                        Approval::Once => {}
-                        Approval::Session => {
-                            reg.set_grant(
-                                &agent,
-                                &project,
-                                registry::Scope::Session { expires: registry::now() + 15 * 60 },
-                            );
-                            let _ = reg.save(&dir, &pass);
-                        }
-                        Approval::Always => {
-                            reg.set_grant(&agent, &project, registry::Scope::Always);
-                            let _ = reg.save(&dir, &pass);
-                        }
-                        Approval::Deny => {
-                            eprintln!("Denied.");
-                            process::exit(1);
-                        }
-                        Approval::NonInteractive => {
-                            eprintln!("'{agent}' is not authorized for '{project}', and no terminal is available to approve.");
-                            eprintln!("Pre-authorize out-of-band:  secrets authorize {agent} {project}");
-                            process::exit(1);
-                        }
-                    }
+                if reg.grant_for(&agent, &project, registry::now()).is_none()
+                    && !ipc_approval(&agent, &project, &command[0], &names, &dir, &pass)
+                {
+                    eprintln!("'{agent}' was not granted access to '{project}'.");
+                    eprintln!("Or pre-authorize out-of-band:  secrets authorize {agent} {project}");
+                    process::exit(1);
                 }
                 eprintln!("secrets exec: agent '{agent}' authorized for '{project}'.");
             }
