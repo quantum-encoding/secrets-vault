@@ -7,6 +7,8 @@ use zeroize::Zeroizing;
 
 use secrets_vault::{is_valid_key, parse_env_lines, Vault, VaultError};
 
+mod keychain;
+
 #[derive(Parser)]
 #[command(name = "secrets", version = "1.0.0")]
 #[command(about = "Encrypted secret manager — AES-256-GCM + PBKDF2")]
@@ -34,6 +36,10 @@ enum Commands {
     Import,
     /// Export all as KEY=VALUE
     Export,
+    /// Store the vault passphrase in the biometric Keychain (Touch ID on read)
+    Unlock,
+    /// Remove the biometric Keychain entry (re-lock)
+    Lock,
 }
 
 fn vault_path() -> std::path::PathBuf {
@@ -48,6 +54,21 @@ fn vault_path() -> std::path::PathBuf {
 }
 
 fn get_passphrase() -> Zeroizing<String> {
+    if let Ok(pass) = env::var("SECRETS_PASSPHRASE") {
+        return Zeroizing::new(pass);
+    }
+    // Biometric Keychain (Touch ID) — the unlocked path. None = not unlocked yet.
+    match keychain::read("Unlock your secrets vault") {
+        Ok(Some(p)) => return Zeroizing::new(p),
+        Ok(None) => {}
+        Err(e) => eprintln!("(keychain unavailable: {e})"),
+    }
+    prompt_only_passphrase()
+}
+
+/// Passphrase from env or a TTY prompt only — never the Keychain. Used by
+/// `unlock` (which is *setting* the Keychain entry) to avoid a circular read.
+fn prompt_only_passphrase() -> Zeroizing<String> {
     if let Ok(pass) = env::var("SECRETS_PASSPHRASE") {
         return Zeroizing::new(pass);
     }
@@ -217,5 +238,34 @@ fn main() {
                 println!("{key}={value}");
             }
         }
+
+        Commands::Unlock => {
+            let pass = prompt_only_passphrase();
+            // If a vault already exists, verify the passphrase decrypts it before
+            // storing — don't lock in a wrong passphrase.
+            if let Ok(data) = fs::read(vault_path()) {
+                if Vault::decrypt(&data, &pass).is_err() {
+                    eprintln!("Wrong passphrase — nothing stored.");
+                    process::exit(1);
+                }
+            }
+            match keychain::store(&pass) {
+                Ok(()) => eprintln!(
+                    "Unlocked. Master key stored in the biometric Keychain — Touch ID required on read."
+                ),
+                Err(e) => {
+                    eprintln!("Keychain store failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+
+        Commands::Lock => match keychain::delete() {
+            Ok(()) => eprintln!("Locked. Biometric Keychain entry removed."),
+            Err(e) => {
+                eprintln!("Keychain delete failed: {e}");
+                process::exit(1);
+            }
+        },
     }
 }

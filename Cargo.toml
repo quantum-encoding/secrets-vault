@@ -39,6 +39,13 @@ atty = { version = "0.2", optional = true }
 default = ["cli"]
 cli = ["dep:clap", "dep:rpassword", "dep:dirs", "dep:atty"]
 
+# macOS biometric Keychain (Touch ID) — the master key lives in the Secure
+# Enclave instead of an env var, gated by the access group in secrets.entitlements.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+security-framework-sys = { version = "2.12", features = ["OSX_10_15"] }
+
 [profile.release]
 opt-level = "z"
 lto = true
