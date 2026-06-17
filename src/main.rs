@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 
 use secrets_vault::{is_valid_key, parse_env_lines, random_bytes, Vault, VaultError};
 
+mod gsm;
 mod keychain;
 mod registry;
 
@@ -29,6 +30,9 @@ enum Commands {
         /// Namespace under a project (stored internally as project/KEY)
         #[arg(long, short)]
         project: Option<String>,
+        /// Store in Google Secret Manager (requires --project = GCP project id)
+        #[arg(long)]
+        gsm: bool,
     },
     /// Generate a random secret and store it — value is NEVER printed
     Gen {
@@ -37,12 +41,15 @@ enum Commands {
         /// Number of random bytes (hex-encoded; default 32 → 64 hex chars)
         #[arg(long, default_value_t = 32)]
         bytes: usize,
-        /// Overwrite if the key already exists
+        /// Overwrite if the key already exists (local only)
         #[arg(long)]
         force: bool,
         /// Namespace under a project (stored internally as project/KEY)
         #[arg(long, short)]
         project: Option<String>,
+        /// Store in Google Secret Manager (requires --project = GCP project id)
+        #[arg(long)]
+        gsm: bool,
     },
     /// Retrieve a secret (stdout, no trailing newline)
     Get {
@@ -112,11 +119,12 @@ fn secrets_dir() -> PathBuf {
         .join("secrets")
 }
 
-/// Resolve the secret NAMES a project needs from `.secrets.toml` (current dir)
-/// or the global `<secrets-dir>/projects.toml`. Supports both
-/// `[projects.<name>] secrets = [...]` and a flat top-level `secrets = [...]`.
-/// Names only ever leave the manifest — values stay in the encrypted vault.
-fn resolve_project_secrets(project: &str) -> Result<Vec<String>, String> {
+/// Load a project's manifest from `.secrets.toml` (current dir) or the global
+/// `<secrets-dir>/projects.toml`: the secret NAMES it needs, plus an optional GSM
+/// backend (`[gsm].project`). Supports `[projects.<name>].secrets`, `[gsm].secrets`,
+/// and a flat top-level `secrets = [...]`. Names only ever leave the manifest —
+/// values stay in the encrypted vault or GSM.
+fn load_manifest(project: &str) -> Result<(Vec<String>, Option<gsm::GsmConfig>), String> {
     let candidates = [PathBuf::from(".secrets.toml"), secrets_dir().join("projects.toml")];
     let path = candidates.iter().find(|p| p.exists()).ok_or_else(|| {
         "no .secrets.toml in this directory (or projects.toml in your secrets dir)".to_string()
@@ -136,7 +144,6 @@ fn resolve_project_secrets(project: &str) -> Result<Vec<String>, String> {
         .ok_or_else(|| {
             format!("no secret list for '{project}' (expected [gsm].secrets, [projects.{project}].secrets, or a top-level secrets = [...])")
         })?;
-
     let names: Vec<String> = arr
         .as_array()
         .ok_or_else(|| "`secrets` must be an array of names".to_string())?
@@ -146,7 +153,30 @@ fn resolve_project_secrets(project: &str) -> Result<Vec<String>, String> {
     if names.is_empty() {
         return Err(format!("project '{project}' lists no secrets"));
     }
-    Ok(names)
+
+    // Optional GSM backend: when [gsm].project is set, values come from Secret
+    // Manager instead of the local vault. account/impersonate fall back to env.
+    let gsm_cfg = table
+        .get("gsm")
+        .and_then(|g| g.get("project"))
+        .and_then(|p| p.as_str())
+        .map(|gcp| gsm::GsmConfig {
+            project: gcp.to_string(),
+            account: table
+                .get("gsm")
+                .and_then(|g| g.get("account"))
+                .and_then(|a| a.as_str())
+                .map(String::from)
+                .or_else(|| env::var("SECRETS_GSM_ACCOUNT").ok()),
+            impersonate: table
+                .get("gsm")
+                .and_then(|g| g.get("impersonate"))
+                .and_then(|a| a.as_str())
+                .map(String::from)
+                .or_else(|| env::var("SECRETS_GSM_IMPERSONATE").ok()),
+        });
+
+    Ok((names, gsm_cfg))
 }
 
 fn get_passphrase() -> Zeroizing<String> {
@@ -259,6 +289,16 @@ fn scoped_key(project: &Option<String>, key: &str) -> String {
             format!("{p}/{key}")
         }
         None => key.to_string(),
+    }
+}
+
+/// Build a GSM config for a GCP project, taking the acting account / impersonation
+/// from the environment (override the active gcloud account if it lacks perms).
+fn gsm_config(project: String) -> gsm::GsmConfig {
+    gsm::GsmConfig {
+        project,
+        account: env::var("SECRETS_GSM_ACCOUNT").ok(),
+        impersonate: env::var("SECRETS_GSM_IMPERSONATE").ok(),
     }
 }
 
@@ -383,8 +423,11 @@ fn eval_warning() {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Set { key, value, project } => {
-            let storage = scoped_key(&project, &key);
+        Commands::Set { key, value, project, gsm } => {
+            if !is_valid_key(&key) {
+                eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
+                process::exit(1);
+            }
             let value = match value {
                 Some(v) => v,
                 None => {
@@ -402,29 +445,67 @@ fn main() {
                 eprintln!("Error: empty value");
                 process::exit(1);
             }
-            let (mut vault, passphrase) = load_vault();
-            vault.set(storage.clone(), value);
-            save_vault(&vault, &passphrase);
-            eprintln!("Stored: {storage}");
+            if gsm {
+                let proj = project.unwrap_or_else(|| {
+                    eprintln!("--gsm requires --project <gcp-project>");
+                    process::exit(1);
+                });
+                let cfg = gsm_config(proj);
+                match gsm::add(&cfg, &key, &value) {
+                    Ok(()) => eprintln!("Stored {key} → GSM project '{}'.", cfg.project),
+                    Err(e) => {
+                        eprintln!("GSM error: {e}");
+                        process::exit(1);
+                    }
+                }
+            } else {
+                let storage = scoped_key(&project, &key);
+                let (mut vault, passphrase) = load_vault();
+                vault.set(storage.clone(), value);
+                save_vault(&vault, &passphrase);
+                eprintln!("Stored: {storage}");
+            }
         }
 
-        Commands::Gen { key, bytes, force, project } => {
-            let storage = scoped_key(&project, &key);
+        Commands::Gen { key, bytes, force, project, gsm } => {
+            if !is_valid_key(&key) {
+                eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
+                process::exit(1);
+            }
             if bytes == 0 || bytes > 1024 {
                 eprintln!("Error: --bytes must be between 1 and 1024");
                 process::exit(1);
             }
-            let (mut vault, passphrase) = load_vault();
-            if vault.get(&storage).is_some() && !force {
-                eprintln!("'{storage}' already exists — use --force to regenerate (overwrites).");
-                process::exit(1);
-            }
-            // Random bytes → hex → vault. The value is NEVER printed (no stdout,
-            // no scrollback, no shell history): the agent only handles the name.
+            // Random bytes → hex. The value is NEVER printed (no stdout, no
+            // scrollback, no shell history): the agent only handles the name.
             let value = to_hex(&random_bytes(bytes));
-            vault.set(storage.clone(), value);
-            save_vault(&vault, &passphrase);
-            eprintln!("Generated {storage} ({bytes} random bytes, hex) — value stored, never printed.");
+            if gsm {
+                let proj = project.unwrap_or_else(|| {
+                    eprintln!("--gsm requires --project <gcp-project>");
+                    process::exit(1);
+                });
+                let cfg = gsm_config(proj);
+                match gsm::add(&cfg, &key, &value) {
+                    Ok(()) => eprintln!(
+                        "Generated {key} ({bytes} bytes) → GSM project '{}' — value never printed.",
+                        cfg.project
+                    ),
+                    Err(e) => {
+                        eprintln!("GSM error: {e}");
+                        process::exit(1);
+                    }
+                }
+            } else {
+                let storage = scoped_key(&project, &key);
+                let (mut vault, passphrase) = load_vault();
+                if vault.get(&storage).is_some() && !force {
+                    eprintln!("'{storage}' already exists — use --force to regenerate (overwrites).");
+                    process::exit(1);
+                }
+                vault.set(storage.clone(), value);
+                save_vault(&vault, &passphrase);
+                eprintln!("Generated {storage} ({bytes} random bytes, hex) — value stored, never printed.");
+            }
         }
 
         Commands::Get { key, project } => {
@@ -532,7 +613,7 @@ fn main() {
                 eprintln!("Invalid project: '{project}'");
                 process::exit(1);
             }
-            let names = resolve_project_secrets(&project).unwrap_or_else(|e| {
+            let (names, gsm_cfg) = load_manifest(&project).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 process::exit(1);
             });
@@ -561,27 +642,65 @@ fn main() {
                 eprintln!("secrets exec: agent '{agent}' authorized for '{project}'.");
             }
 
-            // Decrypt the vault (reuse pass — no second tap) and inject the
-            // project-scoped values under their clean env-var names.
-            let vault = load_vault_with(&pass);
+            // Inject the project-scoped values under their clean env-var names.
+            // Source is either Google Secret Manager (when [gsm].project is set in
+            // the manifest) or the local biometric vault (reuse `pass` — no second
+            // tap). Values go ONLY into the child's env, never argv.
             let mut cmd = process::Command::new(&command[0]);
             cmd.args(&command[1..]);
             cmd.env_remove("SECRETS_PASSPHRASE");
 
             let mut injected = 0usize;
             let mut missing: Vec<&str> = Vec::new();
-            for name in &names {
-                let skey = format!("{project}/{name}");
-                match vault.get(&skey) {
-                    Some(value) => {
-                        cmd.env(name, value); // ONLY into the child's env
-                        injected += 1;
+            match &gsm_cfg {
+                Some(cfg) => {
+                    eprintln!(
+                        "secrets exec: pulling {} secret(s) from Secret Manager (gcp: {})",
+                        names.len(),
+                        cfg.project
+                    );
+                    for name in &names {
+                        match gsm::access(cfg, name) {
+                            Ok(value) => {
+                                // gcloud preserves the payload verbatim; strip a
+                                // single trailing newline only if the value has one
+                                // (added by some `--data-file` workflows).
+                                let v = value.strip_suffix('\n').unwrap_or(&value);
+                                cmd.env(name, v);
+                                injected += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("  ! {name}: {e}");
+                                missing.push(name.as_str());
+                            }
+                        }
                     }
-                    None => missing.push(name.as_str()),
+                    if !missing.is_empty() {
+                        eprintln!(
+                            "warning: could not fetch from Secret Manager, skipped: {}",
+                            missing.join(", ")
+                        );
+                    }
                 }
-            }
-            if !missing.is_empty() {
-                eprintln!("warning: not in vault, skipped: {}", missing.join(", "));
+                None => {
+                    let vault = load_vault_with(&pass);
+                    for name in &names {
+                        let skey = format!("{project}/{name}");
+                        match vault.get(&skey) {
+                            Some(value) => {
+                                cmd.env(name, value); // ONLY into the child's env
+                                injected += 1;
+                            }
+                            None => missing.push(name.as_str()),
+                        }
+                    }
+                    if !missing.is_empty() {
+                        eprintln!("warning: not in vault, skipped: {}", missing.join(", "));
+                    }
+                    // The child gets its own env copy on spawn; zeroize the vault
+                    // plaintext in OUR RAM immediately after injection.
+                    drop(vault);
+                }
             }
             eprintln!(
                 "secrets exec: injecting {injected} secret(s) into `{}` (project: {project})",
@@ -592,10 +711,6 @@ fn main() {
                 eprintln!("Failed to spawn `{}`: {e}", command[0]);
                 process::exit(127);
             });
-
-            // The child holds its own env copy now — zeroize the vault plaintext
-            // (and master key, already dropped) in OUR RAM immediately.
-            drop(vault);
 
             let status = child.wait().unwrap_or_else(|e| {
                 eprintln!("Failed waiting for child: {e}");
