@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use rpassword::prompt_password;
 use zeroize::Zeroizing;
 
-use secrets_vault::{is_valid_key, parse_env_lines, Vault, VaultError};
+use secrets_vault::{is_valid_key, parse_env_lines, random_bytes, Vault, VaultError};
 
 mod keychain;
 
@@ -22,6 +22,17 @@ struct Cli {
 enum Commands {
     /// Store a secret (prompts if no value given)
     Set { key: String, value: Option<String> },
+    /// Generate a random secret and store it — value is NEVER printed
+    Gen {
+        /// Secret name
+        key: String,
+        /// Number of random bytes (hex-encoded; default 32 → 64 hex chars)
+        #[arg(long, default_value_t = 32)]
+        bytes: usize,
+        /// Overwrite if the key already exists
+        #[arg(long)]
+        force: bool,
+    },
     /// Retrieve a secret (stdout, no trailing newline)
     Get { key: String },
     /// Remove a secret
@@ -204,6 +215,28 @@ fn save_vault(vault: &Vault, passphrase: &str) {
     }
 }
 
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Loud stderr warning for the `secrets env` vault-dump footgun.
+fn eval_warning() {
+    let (red, bold, off) = if atty::is(atty::Stream::Stderr) {
+        ("\x1b[1;31m", "\x1b[1m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    eprintln!("{red}⚠️  WARNING:{off} `secrets env` dumps your ENTIRE vault into the shell");
+    eprintln!("   environment — every secret is then exposed to ALL child processes");
+    eprintln!("   (including untrusted npm/pip postinstall scripts).");
+    eprintln!("   Use {bold}secrets exec <project> -- <cmd>{off} for scoped, child-only injection.");
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -233,6 +266,28 @@ fn main() {
             vault.set(key.clone(), value);
             save_vault(&vault, &passphrase);
             eprintln!("Stored: {key}");
+        }
+
+        Commands::Gen { key, bytes, force } => {
+            if !is_valid_key(&key) {
+                eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
+                process::exit(1);
+            }
+            if bytes == 0 || bytes > 1024 {
+                eprintln!("Error: --bytes must be between 1 and 1024");
+                process::exit(1);
+            }
+            let (mut vault, passphrase) = load_vault();
+            if vault.get(&key).is_some() && !force {
+                eprintln!("'{key}' already exists — use --force to regenerate (overwrites).");
+                process::exit(1);
+            }
+            // Random bytes → hex → vault. The value is NEVER printed (no stdout,
+            // no scrollback, no shell history): the agent only handles the name.
+            let value = to_hex(&random_bytes(bytes));
+            vault.set(key.clone(), value);
+            save_vault(&vault, &passphrase);
+            eprintln!("Generated {key} ({bytes} random bytes, hex) — value stored, never printed.");
         }
 
         Commands::Get { key } => {
@@ -265,6 +320,12 @@ fn main() {
         }
 
         Commands::Env { json } => {
+            // The `eval $(secrets env)` footgun — warn loudly (to stderr, so it
+            // doesn't pollute the eval'd stdout). The shell-exports form is the one
+            // people pipe into `eval`, so target that path.
+            if !json {
+                eval_warning();
+            }
             let (vault, _) = load_vault();
             if json {
                 print!("{}", vault.to_json());

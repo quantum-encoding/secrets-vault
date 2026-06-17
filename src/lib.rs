@@ -335,6 +335,14 @@ pub fn parse_env_lines(input: &str) -> Vec<(String, String)> {
     pairs
 }
 
+/// Generate `n` cryptographically secure random bytes from the OS CSPRNG.
+/// Used by `secrets gen` so a fresh credential never has to be printed.
+pub fn random_bytes(n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    OsRng.fill_bytes(&mut buf);
+    buf
+}
+
 // ── Internal: Binary serialization (QVLT format) ──
 
 fn serialize(entries: &BTreeMap<String, String>) -> Vec<u8> {
