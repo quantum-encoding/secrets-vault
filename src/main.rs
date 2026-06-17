@@ -9,9 +9,12 @@ use zeroize::Zeroizing;
 
 use secrets_vault::{is_valid_key, parse_env_lines, random_bytes, Vault, VaultError};
 
+mod backend;
 mod gsm;
 mod keychain;
 mod registry;
+
+use backend::Backend;
 
 #[derive(Parser)]
 #[command(name = "secrets", version = "1.0.0")]
@@ -33,6 +36,10 @@ enum Commands {
         /// Store in Google Secret Manager (requires --project = GCP project id)
         #[arg(long)]
         gsm: bool,
+        /// Write to the external backend configured in .secrets.toml's [backend]
+        /// block (AWS / Vault / Doppler / 1Password / …) instead of the local vault.
+        #[arg(long)]
+        remote: bool,
     },
     /// Generate a random secret and store it — value is NEVER printed
     Gen {
@@ -50,6 +57,10 @@ enum Commands {
         /// Store in Google Secret Manager (requires --project = GCP project id)
         #[arg(long)]
         gsm: bool,
+        /// Write to the external backend configured in .secrets.toml's [backend]
+        /// block (AWS / Vault / Doppler / …) instead of the local vault.
+        #[arg(long)]
+        remote: bool,
     },
     /// Retrieve a secret (stdout, no trailing newline)
     Get {
@@ -126,11 +137,17 @@ fn secrets_dir() -> PathBuf {
 }
 
 /// Load a project's manifest from `.secrets.toml` (current dir) or the global
-/// `<secrets-dir>/projects.toml`: the secret NAMES it needs, plus an optional GSM
-/// backend (`[gsm].project`). Supports `[projects.<name>].secrets`, `[gsm].secrets`,
-/// and a flat top-level `secrets = [...]`. Names only ever leave the manifest —
-/// values stay in the encrypted vault or GSM.
-fn load_manifest(project: &str) -> Result<(Vec<String>, Option<gsm::GsmConfig>), String> {
+/// `<secrets-dir>/projects.toml`: the secret NAMES it needs, plus which `Backend`
+/// supplies the values. Name list comes from `[backend].secrets`, `[gsm].secrets`,
+/// `[projects.<name>].secrets`, or a flat top-level `secrets = [...]`.
+///
+/// Backend selection (first match wins):
+/// 1. `[backend]` table → `kind = "vault" | "gsm" | "command"` (see `backend::from_table`).
+/// 2. `[gsm].project` → Google Secret Manager (backward-compatible shorthand).
+/// 3. otherwise → the local biometric vault.
+///
+/// Only NAMES ever leave the manifest — values stay in the vault or the external manager.
+fn load_manifest(project: &str) -> Result<(Vec<String>, Backend), String> {
     let candidates = [PathBuf::from(".secrets.toml"), secrets_dir().join("projects.toml")];
     let path = candidates.iter().find(|p| p.exists()).ok_or_else(|| {
         "no .secrets.toml in this directory (or projects.toml in your secrets dir)".to_string()
@@ -145,10 +162,11 @@ fn load_manifest(project: &str) -> Result<(Vec<String>, Option<gsm::GsmConfig>),
         .get("projects")
         .and_then(|p| p.get(project))
         .and_then(|s| s.get("secrets"))
+        .or_else(|| table.get("backend").and_then(|b| b.get("secrets"))) // [backend].secrets
         .or_else(|| table.get("gsm").and_then(|g| g.get("secrets"))) // [gsm].secrets
         .or_else(|| table.get("secrets")) // flat top-level
         .ok_or_else(|| {
-            format!("no secret list for '{project}' (expected [gsm].secrets, [projects.{project}].secrets, or a top-level secrets = [...])")
+            format!("no secret list for '{project}' (expected [backend].secrets, [gsm].secrets, [projects.{project}].secrets, or a top-level secrets = [...])")
         })?;
     let names: Vec<String> = arr
         .as_array()
@@ -160,13 +178,16 @@ fn load_manifest(project: &str) -> Result<(Vec<String>, Option<gsm::GsmConfig>),
         return Err(format!("project '{project}' lists no secrets"));
     }
 
-    // Optional GSM backend: when [gsm].project is set, values come from Secret
-    // Manager instead of the local vault. account/impersonate fall back to env.
-    let gsm_cfg = table
-        .get("gsm")
-        .and_then(|g| g.get("project"))
-        .and_then(|p| p.as_str())
-        .map(|gcp| gsm::GsmConfig {
+    Ok((names, select_backend(&table)?))
+}
+
+/// Choose a `Backend` from a parsed manifest table (first match wins):
+/// explicit `[backend]` → `[gsm].project` shorthand → local vault.
+fn select_backend(table: &toml::Table) -> Result<Backend, String> {
+    if let Some(bt) = table.get("backend").and_then(|b| b.as_table()) {
+        backend::from_table(bt)
+    } else if let Some(gcp) = table.get("gsm").and_then(|g| g.get("project")).and_then(|p| p.as_str()) {
+        Ok(Backend::Gsm(gsm::GsmConfig {
             project: gcp.to_string(),
             account: table
                 .get("gsm")
@@ -180,9 +201,30 @@ fn load_manifest(project: &str) -> Result<(Vec<String>, Option<gsm::GsmConfig>),
                 .and_then(|a| a.as_str())
                 .map(String::from)
                 .or_else(|| env::var("SECRETS_GSM_IMPERSONATE").ok()),
-        });
+        }))
+    } else {
+        Ok(Backend::Vault)
+    }
+}
 
-    Ok((names, gsm_cfg))
+/// Read just the backend from the manifest — for `set --remote` / `gen --remote`,
+/// which write a value but don't need the project's secret-name list. Errors if no
+/// manifest exists or it selects the local vault (there's nothing "remote" to write).
+fn manifest_backend() -> Result<Backend, String> {
+    let candidates = [PathBuf::from(".secrets.toml"), secrets_dir().join("projects.toml")];
+    let path = candidates.iter().find(|p| p.exists()).ok_or_else(|| {
+        "no .secrets.toml in this directory (or projects.toml in your secrets dir)".to_string()
+    })?;
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let table: toml::Table = content
+        .parse()
+        .map_err(|e| format!("invalid TOML in {}: {e}", path.display()))?;
+    let be = select_backend(&table)?;
+    if !be.is_external() {
+        return Err("no external [backend] in .secrets.toml — nothing to write with --remote".into());
+    }
+    Ok(be)
 }
 
 /// Obtain the master passphrase: `SECRETS_PASSPHRASE` env → biometric Keychain read
@@ -451,7 +493,7 @@ fn eval_warning() {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Set { key, value, project, gsm } => {
+        Commands::Set { key, value, project, gsm, remote } => {
             if !is_valid_key(&key) {
                 eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
                 process::exit(1);
@@ -473,7 +515,19 @@ fn main() {
                 eprintln!("Error: empty value");
                 process::exit(1);
             }
-            if gsm {
+            if remote {
+                let be = manifest_backend().unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                });
+                match be.add(&key, &value) {
+                    Ok(()) => eprintln!("Stored {key} → {}.", be.label()),
+                    Err(e) => {
+                        eprintln!("{} error: {e}", be.label());
+                        process::exit(1);
+                    }
+                }
+            } else if gsm {
                 let proj = project.unwrap_or_else(|| {
                     eprintln!("--gsm requires --project <gcp-project>");
                     process::exit(1);
@@ -495,7 +549,7 @@ fn main() {
             }
         }
 
-        Commands::Gen { key, bytes, force, project, gsm } => {
+        Commands::Gen { key, bytes, force, project, gsm, remote } => {
             if !is_valid_key(&key) {
                 eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
                 process::exit(1);
@@ -507,7 +561,22 @@ fn main() {
             // Random bytes → hex. The value is NEVER printed (no stdout, no
             // scrollback, no shell history): the agent only handles the name.
             let value = to_hex(&random_bytes(bytes));
-            if gsm {
+            if remote {
+                let be = manifest_backend().unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                });
+                match be.add(&key, &value) {
+                    Ok(()) => eprintln!(
+                        "Generated {key} ({bytes} bytes) → {} — value never printed.",
+                        be.label()
+                    ),
+                    Err(e) => {
+                        eprintln!("{} error: {e}", be.label());
+                        process::exit(1);
+                    }
+                }
+            } else if gsm {
                 let proj = project.unwrap_or_else(|| {
                     eprintln!("--gsm requires --project <gcp-project>");
                     process::exit(1);
@@ -659,7 +728,7 @@ fn main() {
                 eprintln!("Invalid project: '{project}'");
                 process::exit(1);
             }
-            let (names, gsm_cfg) = load_manifest(&project).unwrap_or_else(|e| {
+            let (names, be) = load_manifest(&project).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 process::exit(1);
             });
@@ -691,46 +760,18 @@ fn main() {
             }
 
             // Inject the project-scoped values under their clean env-var names.
-            // Source is either Google Secret Manager (when [gsm].project is set in
-            // the manifest) or the local biometric vault (reuse `pass` — no second
-            // tap). Values go ONLY into the child's env, never argv.
+            // Source is the configured Backend: the local biometric vault (reuse
+            // `pass` — no second tap), or any external manager (GSM / AWS / Vault /
+            // 1Password / Doppler / …) via its CLI. Values go ONLY into the child's
+            // env, never argv.
             let mut cmd = process::Command::new(&command[0]);
             cmd.args(&command[1..]);
             cmd.env_remove("SECRETS_PASSPHRASE");
 
             let mut injected = 0usize;
             let mut missing: Vec<&str> = Vec::new();
-            match &gsm_cfg {
-                Some(cfg) => {
-                    eprintln!(
-                        "secrets exec: pulling {} secret(s) from Secret Manager (gcp: {})",
-                        names.len(),
-                        cfg.project
-                    );
-                    for name in &names {
-                        match gsm::access(cfg, name) {
-                            Ok(value) => {
-                                // gcloud preserves the payload verbatim; strip a
-                                // single trailing newline only if the value has one
-                                // (added by some `--data-file` workflows).
-                                let v = value.strip_suffix('\n').unwrap_or(&value);
-                                cmd.env(name, v);
-                                injected += 1;
-                            }
-                            Err(e) => {
-                                eprintln!("  ! {name}: {e}");
-                                missing.push(name.as_str());
-                            }
-                        }
-                    }
-                    if !missing.is_empty() {
-                        eprintln!(
-                            "warning: could not fetch from Secret Manager, skipped: {}",
-                            missing.join(", ")
-                        );
-                    }
-                }
-                None => {
+            match &be {
+                Backend::Vault => {
                     let vault = load_vault_with(&pass);
                     for name in &names {
                         let skey = format!("{project}/{name}");
@@ -748,6 +789,34 @@ fn main() {
                     // The child gets its own env copy on spawn; zeroize the vault
                     // plaintext in OUR RAM immediately after injection.
                     drop(vault);
+                }
+                external => {
+                    eprintln!(
+                        "secrets exec: pulling {} secret(s) from {}",
+                        names.len(),
+                        external.label()
+                    );
+                    for name in &names {
+                        match external.access(name) {
+                            // Value already has its trailing newline handled by the
+                            // backend; goes ONLY into the child's env, never argv.
+                            Ok(value) => {
+                                cmd.env(name, value);
+                                injected += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("  ! {name}: {e}");
+                                missing.push(name.as_str());
+                            }
+                        }
+                    }
+                    if !missing.is_empty() {
+                        eprintln!(
+                            "warning: could not fetch from {}, skipped: {}",
+                            external.label(),
+                            missing.join(", ")
+                        );
+                    }
                 }
             }
             eprintln!(

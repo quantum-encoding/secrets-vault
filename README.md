@@ -183,6 +183,71 @@ secrets gen  API_KEY         --gsm --project my-gcp-project   # generate → GSM
 secrets exec myapp -- ./deploy.sh                              # exec pulls from GSM
 ```
 
+### 5b. Any other secret manager — the generic `[backend]`
+
+Not on GSM? Point a project at **any** secret manager that has a CLI, with no code
+change. A generic `[backend]` runs commands you define: `{name}` is substituted with
+the secret name, read **values come back on stdout**, and write values are **piped to
+stdin** — so a value never lands in `argv` (where `ps` would leak it).
+
+```toml
+# .secrets.toml
+[backend]
+kind    = "command"
+name    = "my-manager"                 # label for log lines
+secrets = ["API_KEY", "DATABASE_URL"]  # names this project needs
+read    = ["mgr", "get", "{name}"]     # prints the value to stdout
+write   = ["mgr", "put", "{name}"]     # reads the value from stdin (optional → read-only)
+# strip_trailing_newline = true        # default; set false to keep exact trailing bytes
+```
+
+```bash
+secrets exec myapp -- cargo run        # reads via the `read` command, injects child-only
+secrets set  API_KEY "value" --remote  # writes via the `write` command (value on stdin)
+secrets gen  API_KEY         --remote  # generates → writes via `write`, never printed
+```
+
+#### Verified recipes
+
+Drop the matching `[backend]` block into `.secrets.toml`. Reads keep values off `argv`
+in every case; writes that can't avoid `argv` are omitted (use the vendor CLI to write).
+
+**AWS Secrets Manager** — needs `aws` configured (`--region`/`--profile` as needed):
+```toml
+[backend]
+kind  = "command"
+name  = "aws"
+read  = ["aws", "secretsmanager", "get-secret-value", "--secret-id", "{name}", "--query", "SecretString", "--output", "text"]
+write = ["aws", "secretsmanager", "put-secret-value", "--secret-id", "{name}", "--secret-string", "file:///dev/stdin"]
+```
+
+**HashiCorp Vault** — KV v2 at mount `secret`, value under field `value`:
+```toml
+[backend]
+kind  = "command"
+name  = "vault"
+read  = ["vault", "kv", "get", "-mount=secret", "-field=value", "{name}"]
+write = ["vault", "kv", "put", "-mount=secret", "{name}", "value=-"]   # `-` reads stdin
+```
+
+**Doppler** — set `--project`/`--config` (or rely on the local `doppler setup`):
+```toml
+[backend]
+kind = "command"
+name = "doppler"
+read = ["doppler", "secrets", "get", "{name}", "--plain"]
+# writes: use `doppler secrets set` directly (it takes the value on argv)
+```
+
+**1Password** — secret-reference reads via `op read` (item/field as you store them):
+```toml
+[backend]
+kind = "command"
+name = "1password"
+read = ["op", "read", "op://Private/{name}/password"]
+# writes: use `op item edit` directly (read-only here)
+```
+
 ### 6. Strict mode — close the Touch ID grace window
 
 A normal (`UserPresence`) unlock honors macOS's **system Touch ID reuse grace**: after
