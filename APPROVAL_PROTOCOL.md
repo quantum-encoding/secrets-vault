@@ -172,3 +172,72 @@ secrets list-projects                                     # inspect grants (Touc
 
 All are biometric-gated and write the encrypted registry. aiconductor never needs
 to touch the registry file directly when using these.
+
+---
+
+## 8. Network-connection approvals (GuardianShield interactive firewall)
+
+The **same** request/response handshake + glass-slab consent UI (SecretsApprovalKit)
+is reused by GuardianShield's Network Extension to turn silent blocking into a
+human-in-the-loop firewall. The request carries a `type` discriminator; absent ⇒
+`secrets` (so §3 stays valid). Network requests set `"type": "network_connection"`.
+
+### Why a different directory
+
+The NE (`NEFilterDataProvider`) is **strictly sandboxed** — it cannot write
+`~/.secrets/`. It writes into the shared **App Group container**:
+
+```
+~/Library/Group Containers/group.io.quantumencoding.workspace/pending_approvals/
+```
+
+Both GuardianShield (writer) and the approver app (reader) hold that App-Group
+entitlement, so the dir is reachable by both. The approver's `SecretsApprovalCenter`
+must watch this dir **in addition to** `~/.secrets/` (point it via the same
+`$SECRETS_APPROVAL_DIR` mechanism, or watch both).
+
+### Request file — `<id>.json` (NE → app)
+
+```jsonc
+{
+  "id":          "<uuid>",            // also the filename stem; keys the paused flow
+  "type":        "network_connection",
+  "agent":       "Brave Browser",     // resolved process name
+  "destination": "youtube.com",       // target host (or IP if no DNS name)
+  "port":        443
+}
+```
+
+### Response file — `<id>_response.json` (app → NE)
+
+Unlike the secrets beep (whose content is ignored — the registry is the truth),
+this content **IS authoritative**: there's no registry behind a firewall verdict, so
+the NE resumes the paused flow from it.
+
+```jsonc
+{ "id": "<uuid>", "decision": "allow_once" }   // | "allow_always" | "deny"
+```
+
+- `allow_once` → `resumeFlow(flow, with: .allow())` for this flow only.
+- `allow_always` → `.allow()` **and** add `destination` to the NE's dynamic allowlist
+  (so subsequent flows to that host bypass the prompt entirely).
+- `deny` → `resumeFlow(flow, with: .drop())`.
+
+### NE-side contract (the non-obvious bits)
+
+- **Defer, don't drop:** `handleNewFlow` returns `NEFilterNewFlowVerdict.pause()` and
+  stores the `NEFilterFlow` keyed by `id`. Resume **on the same serial queue** as
+  `handleNewFlow` to avoid the "Ignoring resume command for flow … which does not
+  exist" race.
+- **UDP is on a clock:** a paused **UDP** flow (QUIC / HTTP-3 = UDP 443) is
+  **auto-dropped by the system after 10 s**. So the prompt timeout must be < 10 s and
+  default to `deny` (fail-closed) on expiry.
+- **Cache hard:** only the *first* flow to a new `(process, host)` pauses; decisions
+  cache so a single web page's dozens of hosts don't each prompt.
+- **Backstop:** if the approver app isn't running (no response), the NE must fail to a
+  safe default after timeout and a drop-rate **circuit breaker** must auto-revert to
+  audit — never black-hole connectivity (the "left it in enforce and nuked the
+  internet" failure mode).
+- **Trust boundary:** the response lives in the App-Group container (not the
+  world-writable `~/.secrets/`), but it is still a *same-user* channel — acceptable for
+  a firewall (Little Snitch trusts the GUI choice too) given the fail-closed default.
