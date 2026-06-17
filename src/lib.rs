@@ -310,6 +310,17 @@ pub fn is_valid_key(key: &str) -> bool {
         && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Check a project namespace is safe to use as a vault-key prefix: non-empty,
+/// ≤256 bytes, and `[A-Za-z0-9_.-]` only — crucially NO slash, so `project/KEY`
+/// has exactly one separator and can't be traversal/injection-abused.
+pub fn is_valid_project(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_KEY_LEN
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
 /// Parse KEY=VALUE lines (with optional `export` prefix and quote stripping).
 ///
 /// Useful for importing from `.env` files or shell config exports.

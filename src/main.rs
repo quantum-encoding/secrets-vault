@@ -22,7 +22,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Store a secret (prompts if no value given)
-    Set { key: String, value: Option<String> },
+    Set {
+        key: String,
+        value: Option<String>,
+        /// Namespace under a project (stored internally as project/KEY)
+        #[arg(long, short)]
+        project: Option<String>,
+    },
     /// Generate a random secret and store it — value is NEVER printed
     Gen {
         /// Secret name
@@ -33,9 +39,17 @@ enum Commands {
         /// Overwrite if the key already exists
         #[arg(long)]
         force: bool,
+        /// Namespace under a project (stored internally as project/KEY)
+        #[arg(long, short)]
+        project: Option<String>,
     },
     /// Retrieve a secret (stdout, no trailing newline)
-    Get { key: String },
+    Get {
+        key: String,
+        /// Namespace under a project (stored internally as project/KEY)
+        #[arg(long, short)]
+        project: Option<String>,
+    },
     /// Remove a secret
     Delete { key: String },
     /// List all stored key names
@@ -116,9 +130,10 @@ fn resolve_project_secrets(project: &str) -> Result<Vec<String>, String> {
         .get("projects")
         .and_then(|p| p.get(project))
         .and_then(|s| s.get("secrets"))
-        .or_else(|| table.get("secrets"))
+        .or_else(|| table.get("gsm").and_then(|g| g.get("secrets"))) // [gsm].secrets
+        .or_else(|| table.get("secrets")) // flat top-level
         .ok_or_else(|| {
-            format!("no secret list for '{project}' (expected [projects.{project}].secrets or a top-level secrets = [...])")
+            format!("no secret list for '{project}' (expected [gsm].secrets, [projects.{project}].secrets, or a top-level secrets = [...])")
         })?;
 
     let names: Vec<String> = arr
@@ -228,6 +243,92 @@ fn save_vault(vault: &Vault, passphrase: &str) {
     }
 }
 
+/// Validate key (+ project) and build the storage key: `project/KEY` or `KEY`.
+fn scoped_key(project: &Option<String>, key: &str) -> String {
+    if !is_valid_key(key) {
+        eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
+        process::exit(1);
+    }
+    match project {
+        Some(p) => {
+            if !secrets_vault::is_valid_project(p) {
+                eprintln!("Invalid project: '{p}' (use A-Z, 0-9, _, -, .)");
+                process::exit(1);
+            }
+            format!("{p}/{key}")
+        }
+        None => key.to_string(),
+    }
+}
+
+/// Decrypt the vault with an already-obtained passphrase — so callers that
+/// already prompted Touch ID (e.g. `exec`, which also unlocked the registry)
+/// don't trigger a SECOND biometric prompt.
+fn load_vault_with(passphrase: &str) -> Vault {
+    let path = vault_path();
+    let data = match fs::read(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vault::new(),
+        Err(e) => {
+            eprintln!("Error reading vault: {e}");
+            process::exit(1);
+        }
+    };
+    match Vault::decrypt(&data, passphrase) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("Error: wrong passphrase");
+            process::exit(1);
+        }
+    }
+}
+
+enum Approval {
+    Once,
+    Session,
+    Always,
+    Deny,
+    NonInteractive,
+}
+
+/// Present the 4-option approval reading ONLY from the controlling terminal
+/// (`/dev/tty`) — never stdin — so an agent that owns our stdin can't pipe a fake
+/// answer. If `/dev/tty` can't be opened (unattended/agent context), returns
+/// NonInteractive so the caller fails closed.
+fn approval_prompt(agent: &str, project: &str, keys: &[String], cmd: &str) -> Approval {
+    use std::io::{BufRead, BufReader, Write};
+    let tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        Ok(t) => t,
+        Err(_) => return Approval::NonInteractive,
+    };
+    let mut w = match tty.try_clone() {
+        Ok(t) => t,
+        Err(_) => return Approval::NonInteractive,
+    };
+    let _ = write!(
+        w,
+        "\n🔐  {agent}  wants  {k}\n    from project  {project}\n    to pipe into  {cmd}\n\n\
+         \x20 [1] Allow once          (Touch ID each time — most secure)\n\
+         \x20 [2] Allow this session  (15 min — any local process can reuse)\n\
+         \x20 [3] Always allow        (permanent — un-gated until you revoke)\n\
+         \x20 [4] Deny\n\n\
+         \x20 choice [1-4]: ",
+        k = keys.join(", ")
+    );
+    let _ = w.flush();
+    let mut line = String::new();
+    let mut r = BufReader::new(tty);
+    if r.read_line(&mut line).is_err() {
+        return Approval::Deny;
+    }
+    match line.trim() {
+        "1" => Approval::Once,
+        "2" => Approval::Session,
+        "3" => Approval::Always,
+        _ => Approval::Deny,
+    }
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -253,11 +354,8 @@ fn eval_warning() {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Set { key, value } => {
-            if !is_valid_key(&key) {
-                eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
-                process::exit(1);
-            }
+        Commands::Set { key, value, project } => {
+            let storage = scoped_key(&project, &key);
             let value = match value {
                 Some(v) => v,
                 None => {
@@ -276,36 +374,34 @@ fn main() {
                 process::exit(1);
             }
             let (mut vault, passphrase) = load_vault();
-            vault.set(key.clone(), value);
+            vault.set(storage.clone(), value);
             save_vault(&vault, &passphrase);
-            eprintln!("Stored: {key}");
+            eprintln!("Stored: {storage}");
         }
 
-        Commands::Gen { key, bytes, force } => {
-            if !is_valid_key(&key) {
-                eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
-                process::exit(1);
-            }
+        Commands::Gen { key, bytes, force, project } => {
+            let storage = scoped_key(&project, &key);
             if bytes == 0 || bytes > 1024 {
                 eprintln!("Error: --bytes must be between 1 and 1024");
                 process::exit(1);
             }
             let (mut vault, passphrase) = load_vault();
-            if vault.get(&key).is_some() && !force {
-                eprintln!("'{key}' already exists — use --force to regenerate (overwrites).");
+            if vault.get(&storage).is_some() && !force {
+                eprintln!("'{storage}' already exists — use --force to regenerate (overwrites).");
                 process::exit(1);
             }
             // Random bytes → hex → vault. The value is NEVER printed (no stdout,
             // no scrollback, no shell history): the agent only handles the name.
             let value = to_hex(&random_bytes(bytes));
-            vault.set(key.clone(), value);
+            vault.set(storage.clone(), value);
             save_vault(&vault, &passphrase);
-            eprintln!("Generated {key} ({bytes} random bytes, hex) — value stored, never printed.");
+            eprintln!("Generated {storage} ({bytes} random bytes, hex) — value stored, never printed.");
         }
 
-        Commands::Get { key } => {
+        Commands::Get { key, project } => {
+            let storage = scoped_key(&project, &key);
             let (vault, _) = load_vault();
-            match vault.get(&key) {
+            match vault.get(&storage) {
                 Some(value) => print!("{value}"),
                 None => {
                     eprintln!("Not found: {key}");
@@ -403,26 +499,71 @@ fn main() {
                 eprintln!("Usage: secrets exec <project> -- <command> [args...]");
                 process::exit(2);
             }
+            if !secrets_vault::is_valid_project(&project) {
+                eprintln!("Invalid project: '{project}'");
+                process::exit(1);
+            }
             let names = resolve_project_secrets(&project).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 process::exit(1);
             });
 
-            // One Touch ID prompt here (load_vault → keychain). The master
-            // passphrase is dropped (zeroized) immediately via the `_`.
-            let (vault, _) = load_vault();
+            // One Touch ID: get the passphrase once, reuse for BOTH the registry
+            // and the vault (no double prompt).
+            let pass = get_passphrase();
+            let dir = secrets_dir();
+            let mut reg = registry::Registry::load(&dir, &pass).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
 
+            // Enforcement: a recognized agent must hold a valid grant — or get one
+            // via the /dev/tty prompt. A human / unrecognized caller who already
+            // satisfied Touch ID is the operator and proceeds.
+            if let Some(agent) = registry::resolve_agent() {
+                if reg.grant_for(&agent, &project, registry::now()).is_none() {
+                    match approval_prompt(&agent, &project, &names, &command[0]) {
+                        Approval::Once => {}
+                        Approval::Session => {
+                            reg.set_grant(
+                                &agent,
+                                &project,
+                                registry::Scope::Session { expires: registry::now() + 15 * 60 },
+                            );
+                            let _ = reg.save(&dir, &pass);
+                        }
+                        Approval::Always => {
+                            reg.set_grant(&agent, &project, registry::Scope::Always);
+                            let _ = reg.save(&dir, &pass);
+                        }
+                        Approval::Deny => {
+                            eprintln!("Denied.");
+                            process::exit(1);
+                        }
+                        Approval::NonInteractive => {
+                            eprintln!("'{agent}' is not authorized for '{project}', and no terminal is available to approve.");
+                            eprintln!("Pre-authorize out-of-band:  secrets authorize {agent} {project}");
+                            process::exit(1);
+                        }
+                    }
+                }
+                eprintln!("secrets exec: agent '{agent}' authorized for '{project}'.");
+            }
+
+            // Decrypt the vault (reuse pass — no second tap) and inject the
+            // project-scoped values under their clean env-var names.
+            let vault = load_vault_with(&pass);
             let mut cmd = process::Command::new(&command[0]);
             cmd.args(&command[1..]);
-            // Never let the child inherit the master key, whatever the parent env.
             cmd.env_remove("SECRETS_PASSPHRASE");
 
             let mut injected = 0usize;
             let mut missing: Vec<&str> = Vec::new();
             for name in &names {
-                match vault.get(name) {
+                let skey = format!("{project}/{name}");
+                match vault.get(&skey) {
                     Some(value) => {
-                        cmd.env(name, value); // injected into ONLY the child's env
+                        cmd.env(name, value); // ONLY into the child's env
                         injected += 1;
                     }
                     None => missing.push(name.as_str()),
