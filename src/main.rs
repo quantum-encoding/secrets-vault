@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 use secrets_vault::{is_valid_key, parse_env_lines, random_bytes, Vault, VaultError};
 
 mod keychain;
+mod registry;
 
 #[derive(Parser)]
 #[command(name = "secrets", version = "1.0.0")]
@@ -61,6 +62,18 @@ enum Commands {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Authorize an agent to access a project (Touch ID gated)
+    Authorize {
+        agent: String,
+        project: String,
+        /// Timed session grant in minutes (default: permanent)
+        #[arg(long)]
+        session_minutes: Option<u64>,
+    },
+    /// Revoke an agent's access to a project (Touch ID gated)
+    Revoke { agent: String, project: String },
+    /// List registered projects and agent grants (Touch ID gated)
+    ListProjects,
 }
 
 fn vault_path() -> std::path::PathBuf {
@@ -450,6 +463,80 @@ fn main() {
             #[cfg(not(unix))]
             let code = status.code().unwrap_or(1);
             process::exit(code);
+        }
+
+        Commands::Authorize { agent, project, session_minutes } => {
+            let pass = get_passphrase(); // Touch ID
+            let dir = secrets_dir();
+            let mut reg = registry::Registry::load(&dir, &pass).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            let scope = match session_minutes {
+                Some(m) => registry::Scope::Session { expires: registry::now() + m * 60 },
+                None => registry::Scope::Always,
+            };
+            reg.set_grant(&agent, &project, scope);
+            reg.save(&dir, &pass).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            match session_minutes {
+                Some(m) => eprintln!("Authorized '{agent}' → '{project}' for {m} min."),
+                None => eprintln!("Authorized '{agent}' → '{project}' (permanent)."),
+            }
+        }
+
+        Commands::Revoke { agent, project } => {
+            let pass = get_passphrase();
+            let dir = secrets_dir();
+            let mut reg = registry::Registry::load(&dir, &pass).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            if reg.revoke(&agent, &project) {
+                reg.save(&dir, &pass).unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                });
+                eprintln!("Revoked '{agent}' → '{project}'.");
+            } else {
+                eprintln!("No grant for '{agent}' → '{project}'.");
+                process::exit(1);
+            }
+        }
+
+        Commands::ListProjects => {
+            let pass = get_passphrase();
+            let dir = secrets_dir();
+            let reg = registry::Registry::load(&dir, &pass).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            if reg.projects.is_empty() && reg.grants.is_empty() {
+                println!("(registry empty — no projects or grants yet)");
+            } else {
+                let now = registry::now();
+                if !reg.projects.is_empty() {
+                    println!("Projects:");
+                    for (name, meta) in &reg.projects {
+                        println!("  {name} → {} ({} keys)", meta.gcp_project, meta.keys.len());
+                    }
+                }
+                println!("Grants:");
+                for (agent, projs) in &reg.grants {
+                    for (project, grant) in projs {
+                        let scope = match grant.scope {
+                            registry::Scope::Always => "permanent".to_string(),
+                            registry::Scope::Session { expires } if expires > now => {
+                                format!("session, {}m left", (expires - now) / 60)
+                            }
+                            registry::Scope::Session { .. } => "expired".to_string(),
+                        };
+                        println!("  {agent} → {project} [{scope}]");
+                    }
+                }
+            }
         }
     }
 }

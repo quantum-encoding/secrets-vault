@@ -343,6 +343,60 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
     buf
 }
 
+/// Encrypt arbitrary bytes into the same QVLT container the vault uses (AES-256-GCM,
+/// PBKDF2-SHA256 @ 600k, fresh salt+nonce). Lets other on-disk artifacts (e.g. the
+/// scoped registry) reuse the audited crypto core without touching `Vault`.
+pub fn encrypt_blob(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>, VaultError> {
+    let mut buf = plaintext.to_vec();
+    let mut salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let key = derive_key(passphrase, &salt);
+    let cipher = Aes256Gcm::new(&key);
+    let tag = cipher
+        .encrypt_in_place_detached(&nonce, b"", &mut buf)
+        .map_err(|_| VaultError::EncryptionFailed)?;
+
+    let mut out = Vec::with_capacity(HEADER_LEN + buf.len());
+    out.write_all(&MAGIC)?;
+    out.write_all(&[VERSION])?;
+    out.write_all(&salt)?;
+    out.write_all(nonce.as_slice())?;
+    out.write_all(tag.as_slice())?;
+    out.write_all(&buf)?;
+    buf.zeroize();
+    Ok(out)
+}
+
+/// Decrypt a QVLT container produced by [`encrypt_blob`]. Returns the plaintext
+/// bytes (caller zeroizes after use).
+pub fn decrypt_blob(data: &[u8], passphrase: &str) -> Result<Vec<u8>, VaultError> {
+    if data.len() < HEADER_LEN {
+        return Err(VaultError::TooSmall);
+    }
+    if data[0..4] != MAGIC {
+        return Err(VaultError::BadMagic);
+    }
+    if data[4] != VERSION {
+        return Err(VaultError::UnsupportedVersion(data[4]));
+    }
+    let salt = &data[5..5 + SALT_LEN];
+    let nonce_bytes = &data[5 + SALT_LEN..5 + SALT_LEN + NONCE_LEN];
+    let tag_bytes = &data[5 + SALT_LEN + NONCE_LEN..HEADER_LEN];
+    let ciphertext = &data[HEADER_LEN..];
+
+    let key = derive_key(passphrase, salt);
+    let cipher = Aes256Gcm::new(&key);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let tag = Tag::from_slice(tag_bytes);
+
+    let mut buf = ciphertext.to_vec();
+    cipher
+        .decrypt_in_place_detached(nonce, b"", &mut buf, tag)
+        .map_err(|_| VaultError::DecryptionFailed)?;
+    Ok(buf)
+}
+
 // ── Internal: Binary serialization (QVLT format) ──
 
 fn serialize(entries: &BTreeMap<String, String>) -> Vec<u8> {
