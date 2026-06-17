@@ -96,6 +96,15 @@ enum Commands {
     Revoke { agent: String, project: String },
     /// List registered projects and agent grants (Touch ID gated)
     ListProjects,
+    /// Internal: GUI-session biometric vend helper (invoked by the osascript
+    /// approval dialog via `do shell script`). Reads the master passphrase behind
+    /// Touch ID and deposits it in a transient access-group keychain ticket for
+    /// the waiting headless process. Not for direct use.
+    #[command(name = "_vend", hide = true)]
+    Vend {
+        /// Ticket id (32-char hex) the waiting process is polling for.
+        id: String,
+    },
 }
 
 fn vault_path() -> std::path::PathBuf {
@@ -180,16 +189,84 @@ fn load_manifest(project: &str) -> Result<(Vec<String>, Option<gsm::GsmConfig>),
 }
 
 fn get_passphrase() -> Zeroizing<String> {
+    acquire_passphrase("Unlock your secrets vault", None).0
+}
+
+/// Obtain the master passphrase, returning `(passphrase, approved_via_gui_bridge)`.
+///
+/// Order: `SECRETS_PASSPHRASE` env → direct biometric Keychain read (works when we
+/// have a GUI session, i.e. the user ran us from their own terminal) → if that
+/// yields nothing and there's NO TTY (a headless/agent-driven invocation), pop the
+/// osascript approval dialog whose "Approve with Touch ID" button relaunches us in
+/// the GUI session to vend the passphrase through a keychain ticket → otherwise a
+/// TTY passphrase prompt.
+///
+/// `approved_via_gui_bridge` is true ONLY when the human physically tapped Touch ID
+/// on the request dialog — an unforgeable signal (the ticket it reads is gated by
+/// that tap), so callers may treat it as informed approval for THIS invocation.
+fn acquire_passphrase(title: &str, detail: Option<&str>) -> (Zeroizing<String>, bool) {
     if let Ok(pass) = env::var("SECRETS_PASSPHRASE") {
-        return Zeroizing::new(pass);
+        return (Zeroizing::new(pass), false);
     }
-    // Biometric Keychain (Touch ID) — the unlocked path. None = not unlocked yet.
-    match keychain::read("Unlock your secrets vault") {
-        Ok(Some(p)) => return Zeroizing::new(p),
+    // Direct biometric — the unlocked path. None = not unlocked OR no GUI session
+    // to present the Touch ID sheet (e.g. a backgrounded agent shell).
+    match keychain::read(title) {
+        Ok(Some(p)) => return (Zeroizing::new(p), false),
         Ok(None) => {}
         Err(e) => eprintln!("(keychain unavailable: {e})"),
     }
-    prompt_only_passphrase()
+    // With a controlling terminal we can prompt the human directly.
+    if atty::is(atty::Stream::Stdin) {
+        return (prompt_only_passphrase(), false);
+    }
+    // Headless: bridge to the GUI session for a real Touch ID tap.
+    match gui_bridge_passphrase(title, detail) {
+        Some(p) => (p, true),
+        None => {
+            eprintln!("Approval cancelled (or no GUI session / vault not unlocked).");
+            process::exit(1);
+        }
+    }
+}
+
+/// AppleScript string-literal escaping (backslash + double-quote).
+fn as_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Headless → GUI bridge. Shows an osascript approval dialog (renders via the
+/// WindowServer even with no controlling terminal); on approval it `do shell
+/// script`s us back as `_vend <id>` IN the GUI session, where Touch ID can present.
+/// `_vend` deposits the passphrase in a keychain ticket we then read + delete.
+fn gui_bridge_passphrase(title: &str, detail: Option<&str>) -> Option<Zeroizing<String>> {
+    let self_path = env::current_exe().ok()?;
+    let self_str = self_path.to_string_lossy();
+    let id = to_hex(&random_bytes(16));
+
+    let body = match detail {
+        Some(d) => format!("🔐 {title}\n\n{d}"),
+        None => format!("🔐 {title}"),
+    };
+    // The shell command `_vend` runs (single-quote the path for spaces). The id is
+    // hex, so it needs no quoting.
+    let shell_cmd = format!("'{self_str}' _vend {id}");
+    let script = format!(
+        "set rr to button returned of (display dialog \"{body}\" \
+            buttons {{\"Cancel\", \"Approve with Touch ID\"}} \
+            default button \"Approve with Touch ID\" cancel button \"Cancel\" \
+            with title \"secrets\" with icon caution)\n\
+         if rr is \"Approve with Touch ID\" then do shell script \"{cmd}\"",
+        body = as_escape(&body),
+        cmd = as_escape(&shell_cmd),
+    );
+
+    // osascript exits non-zero on Cancel (user-cancelled error -128) or if `_vend`
+    // fails — either way we just check for the ticket.
+    let _ = process::Command::new("osascript").arg("-e").arg(&script).status();
+
+    let pass = keychain::read_ticket(&id).ok().flatten();
+    let _ = keychain::delete_ticket(&id); // consume — single use
+    pass.map(Zeroizing::new)
 }
 
 /// Passphrase from env or a TTY prompt only — never the Keychain. Used by
@@ -619,27 +696,37 @@ fn main() {
             });
 
             // One Touch ID: get the passphrase once, reuse for BOTH the registry
-            // and the vault (no double prompt).
-            let pass = get_passphrase();
+            // and the vault (no double prompt). When we're headless (agent-driven),
+            // this pops the GUI approval dialog showing exactly what's being asked,
+            // and `approved` becomes true iff the human tapped Touch ID on it.
+            let agent = registry::resolve_agent();
+            let detail = agent.as_deref().map(|a| {
+                format!("{a} wants: {}\nfrom project: {project}\n→ runs: {}", names.join(", "), command[0])
+            });
+            let (pass, approved) = acquire_passphrase("Approve secrets access", detail.as_deref());
             let dir = secrets_dir();
             let reg = registry::Registry::load(&dir, &pass).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 process::exit(1);
             });
 
-            // Enforcement: a recognized agent must hold a valid grant — or earn one
-            // via real-time approval in aiconductor (registry-anchored, NOT the
-            // forgeable response file). A human / unrecognized operator who already
-            // satisfied Touch ID proceeds.
-            if let Some(agent) = registry::resolve_agent() {
-                if reg.grant_for(&agent, &project, registry::now()).is_none()
-                    && !ipc_approval(&agent, &project, &command[0], &names, &dir, &pass)
+            // Enforcement: a recognized agent must hold a valid grant — OR the human
+            // just approved this exact request via the GUI Touch ID tap (`approved`,
+            // an unforgeable signal) — OR it earns one via aiconductor (registry-
+            // anchored, NOT the forgeable response file). A human / unrecognized
+            // operator who already satisfied Touch ID proceeds.
+            if let Some(agent) = &agent {
+                let granted = reg.grant_for(agent, &project, registry::now()).is_some();
+                if !granted
+                    && !approved
+                    && !ipc_approval(agent, &project, &command[0], &names, &dir, &pass)
                 {
                     eprintln!("'{agent}' was not granted access to '{project}'.");
                     eprintln!("Or pre-authorize out-of-band:  secrets authorize {agent} {project}");
                     process::exit(1);
                 }
-                eprintln!("secrets exec: agent '{agent}' authorized for '{project}'.");
+                let how = if granted { "grant" } else { "approval" };
+                eprintln!("secrets exec: agent '{agent}' authorized for '{project}' ({how}).");
             }
 
             // Inject the project-scoped values under their clean env-var names.
@@ -805,5 +892,39 @@ fn main() {
                 }
             }
         }
+
+        Commands::Vend { id } => {
+            // Runs in the GUI session (osascript `do shell script` launched us), so
+            // the Touch ID sheet CAN present here. Read the master passphrase behind
+            // biometry and deposit it in the access-group ticket for the waiting
+            // headless process to pick up. No grant writing — the tap itself is the
+            // approval signal the caller observes via the ticket's existence.
+            if !is_valid_ticket_id(&id) {
+                eprintln!("invalid ticket id");
+                process::exit(2);
+            }
+            match keychain::read("Approve secrets access") {
+                Ok(Some(p)) => {
+                    if let Err(e) = keychain::store_ticket(&id, &p) {
+                        eprintln!("vend failed: {e}");
+                        process::exit(1);
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("vault not unlocked — run: secrets unlock");
+                    process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("biometric read failed: {e}");
+                    process::exit(1);
+                }
+            }
+        }
     }
+}
+
+/// A ticket id is exactly 32 lowercase hex chars (16 random bytes). Defensive —
+/// `_vend`'s only argument crosses the osascript boundary.
+fn is_valid_ticket_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
 }
