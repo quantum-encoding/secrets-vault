@@ -72,7 +72,20 @@ enum Commands {
     /// Remove a secret
     Delete { key: String },
     /// List all stored key names
-    List,
+    List {
+        /// Read the plaintext name index (NO unlock / Touch ID) instead of the vault
+        #[arg(long)]
+        names_only: bool,
+    },
+    /// Check whether a key exists — names only, NO Touch ID, no value exposure.
+    /// Prints `true`/`false`; exits 0 if present, 1 if not. Lets an agent avoid
+    /// generating a duplicate secret without unlocking the vault.
+    Has {
+        key: String,
+        /// Namespace under a project (checks project/KEY)
+        #[arg(long, short)]
+        project: Option<String>,
+    },
     /// Output as shell exports or JSON
     Env {
         #[arg(long)]
@@ -332,6 +345,7 @@ fn save_vault(vault: &Vault, passphrase: &str) {
                 process::exit(1);
             });
         io::Write::write_all(&mut file, &encrypted).unwrap();
+        write_index(vault);
         return;
     }
 
@@ -341,7 +355,45 @@ fn save_vault(vault: &Vault, passphrase: &str) {
             eprintln!("Error writing vault: {e}");
             process::exit(1);
         });
+        write_index(vault);
     }
+}
+
+/// Plaintext index of vault KEY NAMES (never values) at `<secrets-dir>/index.json`,
+/// refreshed on every vault save. Lets an agent answer "do we already have KEY?"
+/// (`secrets has`) and enumerate names (`secrets list --names-only`) with NO Touch
+/// ID and zero value exposure — names aren't secret (the manifest lists them too).
+/// Newline-delimited, owner-only 0600. Best-effort: the encrypted vault stays the
+/// source of truth; the index is only a no-unlock existence hint.
+fn index_path() -> PathBuf {
+    secrets_dir().join("index.json")
+}
+
+fn write_index(vault: &Vault) {
+    let body = vault.keys().collect::<Vec<_>>().join("\n");
+    let path = index_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .write(true).create(true).truncate(true).mode(0o600).open(&path)
+        {
+            io::Write::write_all(&mut f, body.as_bytes()).ok();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&path, body.as_bytes()).ok();
+    }
+}
+
+fn read_index() -> Vec<String> {
+    fs::read_to_string(index_path())
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
 }
 
 /// Validate key (+ project) and build the storage key: `project/KEY` or `KEY`.
@@ -628,11 +680,26 @@ fn main() {
             }
         }
 
-        Commands::List => {
-            let (vault, _) = load_vault();
-            for key in vault.keys() {
-                println!("{key}");
+        Commands::List { names_only } => {
+            if names_only {
+                // No unlock: read the plaintext name index.
+                for key in read_index() {
+                    println!("{key}");
+                }
+            } else {
+                let (vault, _) = load_vault();
+                write_index(&vault); // self-heal the index while we hold the unlocked vault
+                for key in vault.keys() {
+                    println!("{key}");
+                }
             }
+        }
+
+        Commands::Has { key, project } => {
+            let storage = scoped_key(&project, &key);
+            let exists = read_index().iter().any(|k| k == &storage);
+            println!("{exists}");
+            process::exit(if exists { 0 } else { 1 });
         }
 
         Commands::Env { json } => {
