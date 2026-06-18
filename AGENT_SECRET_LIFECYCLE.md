@@ -126,11 +126,22 @@ behind your review — exactly the safe, scriptable rotation loop.
 
 - ✅ **`secrets has` / `secrets list --names-only`** — plaintext name index
   (`<secrets-dir>/index.json`, refreshed on every save; names only, never values),
-  no unlock. *(this commit)*
-- ⛔ **`age` keypair + Keychain identity** — the sealing primitive (shared with
-  PHONE_2FA §5). Add the `age` crate; store the identity behind UserPresence.
-- ⛔ **`set/gen --inbox`, `inbox init|list|merge`** — seal / enumerate / batch-merge.
-  Merge computes new-vs-overwrite against the unlocked vault, then wipes the inbox.
+  no unlock.
+- ✅ **`age` keypair + Keychain identity** — `age` 0.11 (X25519, `armor` only, no
+  default features). Recipient → `inbox.pub` (0644); identity → biometric Keychain
+  (`inbox-identity`, UserPresence). Same sealing primitive PHONE_2FA §5 reuses.
+- ✅ **`set/gen --inbox`** — seal to `inbox.pub` (no tap, no master), append to
+  `inbox.enc` (0600, JSON-lines). Rejects `--gsm`/`--remote` (local-vault only).
+- ✅ **`inbox init|list|merge|drop`** — init (tap-free keypair, lazy on first write);
+  list (names + new/⚠overwrite from the index, no tap); merge (one tap via a shared
+  `read_accounts` auth context → opens identity + master together, classifies
+  new-vs-overwrite against the unlocked vault, merges, refreshes the index, keeps
+  failed entries); drop (reject one, no tap).
+- ✅ **Verified:** seal/open round-trip + write-only property (a different identity
+  cannot open) — `cargo test inbox`; `list`/`drop` + new/overwrite tagging end-to-end.
 
-The keypair + Keychain-identity step needs on-device biometric verification (the
-identity read at merge triggers the same Touch ID sheet the vault master does).
+**On-device step still to confirm with a physical tap:** `inbox init` / `set --inbox`
+store the identity via `SecItemAdd` (needs the signed binary + keychain entitlement,
+same as `unlock`), and `inbox merge` reads identity + master under one shared
+`LAContext` (one tap in normal mode; strict mode demands a fresh tap per item by
+design). Build + `./sign.sh` + install, then verify the single-tap merge on-device.

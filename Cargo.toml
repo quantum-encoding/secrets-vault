@@ -37,10 +37,14 @@ atty = { version = "0.2", optional = true }
 toml = { version = "0.8", optional = true }   # .secrets.toml project manifest (exec)
 serde = { version = "1", features = ["derive"], optional = true } # registry schema
 serde_json = { version = "1", optional = true }                   # registry (de)serialization
+# Write-only inbox: X25519 sealed envelopes (agent seals with the public recipient,
+# no master key / no tap; only the Keychain identity opens them at merge). Vetted,
+# pure-Rust — default features off, only `armor` for ASCII-armored ciphertext.
+age = { version = "0.11", default-features = false, features = ["armor"], optional = true }
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:rpassword", "dep:dirs", "dep:atty", "dep:toml", "dep:serde", "dep:serde_json"]
+cli = ["dep:clap", "dep:rpassword", "dep:dirs", "dep:atty", "dep:toml", "dep:serde", "dep:serde_json", "dep:age"]
 
 # macOS biometric Keychain (Touch ID) — the master key lives in the Secure
 # Enclave instead of an env var, gated by the access group in secrets.entitlements.

@@ -27,8 +27,8 @@ mod imp {
     use security_framework_sys::base::{errSecItemNotFound, errSecSuccess};
     use security_framework_sys::item::{
         kSecAttrAccessControl, kSecAttrAccessGroup, kSecAttrAccount, kSecAttrService, kSecClass,
-        kSecClassGenericPassword, kSecMatchLimit, kSecReturnData, kSecUseAuthenticationContext,
-        kSecUseDataProtectionKeychain, kSecValueData,
+        kSecClassGenericPassword, kSecMatchLimit, kSecReturnAttributes, kSecReturnData,
+        kSecUseAuthenticationContext, kSecUseDataProtectionKeychain, kSecValueData,
     };
     use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemDelete};
     use std::os::raw::{c_char, c_void};
@@ -36,6 +36,9 @@ mod imp {
 
     const SERVICE: &str = "io.quantumencoding.secrets";
     const ACCOUNT: &str = "vault-master";
+    /// The write-only inbox's age identity (AGENT_SECRET_LIFECYCLE.md). Same item
+    /// family / access group as the master, distinct account → opened only at merge.
+    const INBOX_ACCOUNT: &str = "inbox-identity";
     const ACCESS_GROUP: &str = "VLK8CVU5H3.io.quantumencoding.secrets";
 
     // Link LocalAuthentication so the LAContext class is registered at runtime
@@ -48,12 +51,14 @@ mod imp {
         fn objc_msgSend();
     }
 
-    /// Build an `LAContext` with `touchIDAuthenticationAllowableReuseDuration = 0`
-    /// so the keychain read forces a FRESH Touch ID tap with no reuse grace. Handed
-    /// to `SecItemCopyMatching` via `kSecUseAuthenticationContext`. Strict mode only.
+    /// Build an `LAContext` with `touchIDAuthenticationAllowableReuseDuration = reuse`.
+    /// `0.0` forces a FRESH Touch ID tap with no grace (strict reads). A non-zero
+    /// value lets back-to-back reads under the SAME context share one tap — used by
+    /// `read_accounts` so `inbox merge` opens the identity + the vault master with a
+    /// single prompt. Handed to `SecItemCopyMatching` via `kSecUseAuthenticationContext`.
     /// Raw objc runtime (no extra crate); `objc_msgSend` is transmuted to the exact
     /// typed signature per the documented calling convention.
-    fn fresh_auth_context() -> Option<CFType> {
+    fn auth_context(reuse: f64) -> Option<CFType> {
         unsafe {
             let cls = objc_getClass(b"LAContext\0".as_ptr() as *const c_char);
             if cls.is_null() {
@@ -71,7 +76,7 @@ mod imp {
             );
             let set_fn: extern "C" fn(*mut c_void, *mut c_void, f64) =
                 std::mem::transmute(objc_msgSend as *const ());
-            set_fn(obj, sel_set, 0.0_f64);
+            set_fn(obj, sel_set, reuse);
             // `new` returned +1; wrap create-rule so CFType's Drop balances it.
             Some(CFType::wrap_under_create_rule(obj as CFTypeRef))
         }
@@ -87,20 +92,20 @@ mod imp {
     /// elimination: without it, SecItemAdd → errSecMissingEntitlement -34018). The
     /// team-prefixed group is a profile-free entitlement, so Developer ID signing
     /// alone satisfies it — no provisioning profile needed.
-    fn base_query() -> Vec<(CFType, CFType)> {
+    fn base_query(account: &str) -> Vec<(CFType, CFType)> {
         unsafe {
             vec![
                 (cfs(kSecClass), cfs(kSecClassGenericPassword)),
                 (cfs(kSecAttrService), CFString::new(SERVICE).as_CFType()),
-                (cfs(kSecAttrAccount), CFString::new(ACCOUNT).as_CFType()),
+                (cfs(kSecAttrAccount), CFString::new(account).as_CFType()),
                 (cfs(kSecAttrAccessGroup), CFString::new(ACCESS_GROUP).as_CFType()),
                 (cfs(kSecUseDataProtectionKeychain), CFBoolean::true_value().as_CFType()),
             ]
         }
     }
 
-    pub fn delete() -> Result<(), String> {
-        let dict = CFDictionary::from_CFType_pairs(&base_query());
+    fn delete_account(account: &str) -> Result<(), String> {
+        let dict = CFDictionary::from_CFType_pairs(&base_query(account));
         let status = unsafe { SecItemDelete(dict.as_concrete_TypeRef()) };
         if status == errSecSuccess || status == errSecItemNotFound {
             Ok(())
@@ -109,14 +114,13 @@ mod imp {
         }
     }
 
-    /// Store the master passphrase. `strict` selects the access-control policy:
+    /// Store a secret string under `account`. `strict` selects the ACL:
     /// - false → `UserPresence`: biometry OR watch OR device passcode; honors the
     ///   system Touch ID reuse grace (convenient: tap once, a burst of reads flow).
     /// - true  → `BiometryCurrentSet`: enrolled biometry ONLY (no watch/passcode
-    ///   fallback) and self-invalidates if the fingerprint set changes. Paired with
-    ///   the zero-reuse context in `read`, every access demands a fresh tap.
-    pub fn store(passphrase: &str, strict: bool) -> Result<(), String> {
-        let _ = delete(); // replace any existing item
+    ///   fallback) and self-invalidates if the fingerprint set changes.
+    fn store_account(account: &str, secret: &str, strict: bool) -> Result<(), String> {
+        let _ = delete_account(account); // replace any existing item
 
         let flags = if strict {
             kSecAccessControlBiometryCurrentSet
@@ -136,8 +140,8 @@ mod imp {
             CFType::wrap_under_create_rule(ac as CFTypeRef)
         };
 
-        let data = CFData::from_buffer(passphrase.as_bytes());
-        let mut pairs = base_query();
+        let data = CFData::from_buffer(secret.as_bytes());
+        let mut pairs = base_query(account);
         pairs.push((unsafe { cfs(kSecAttrAccessControl) }, ac));
         pairs.push((unsafe { cfs(kSecValueData) }, data.as_CFType()));
 
@@ -150,23 +154,16 @@ mod imp {
         }
     }
 
-    /// Read the passphrase, triggering the Touch ID prompt. Ok(None) = not unlocked.
-    /// When `strict`, attach a zero-reuse `LAContext` so this read forces a fresh
-    /// tap (no grace-window reuse). Keep `_ctx` alive until after the call.
-    pub fn read(_prompt: &str, strict: bool) -> Result<Option<String>, String> {
-        let mut pairs = base_query();
+    /// Read one account's secret, attaching an optional shared auth context. The
+    /// `_ctx` must outlive the call; pass it in so several reads can share one tap.
+    fn read_account_with(account: &str, ctx: Option<&CFType>) -> Result<Option<String>, String> {
+        let mut pairs = base_query(account);
         pairs.push((unsafe { cfs(kSecReturnData) }, CFBoolean::true_value().as_CFType()));
         // kSecMatchLimit accepts a count CFNumber (the crate doesn't export the
-        // kSecMatchLimitOne string constant). Custom Touch ID prompt text needs
-        // LAContext (phase-2 polish); the OS shows its default biometric prompt.
+        // kSecMatchLimitOne string constant). The OS shows its default biometric prompt.
         pairs.push((unsafe { cfs(kSecMatchLimit) }, CFNumber::from(1i64).as_CFType()));
-
-        let _ctx; // must outlive SecItemCopyMatching
-        if strict {
-            if let Some(ctx) = fresh_auth_context() {
-                _ctx = ctx;
-                pairs.push((unsafe { cfs(kSecUseAuthenticationContext) }, _ctx.clone()));
-            }
+        if let Some(ctx) = ctx {
+            pairs.push((unsafe { cfs(kSecUseAuthenticationContext) }, ctx.clone()));
         }
 
         let dict = CFDictionary::from_CFType_pairs(&pairs);
@@ -187,6 +184,80 @@ mod imp {
             .map(Some)
             .map_err(|_| "keychain value is not valid UTF-8".into())
     }
+
+    pub fn delete() -> Result<(), String> {
+        delete_account(ACCOUNT)
+    }
+
+    /// Store the vault master passphrase (account `vault-master`).
+    pub fn store(passphrase: &str, strict: bool) -> Result<(), String> {
+        store_account(ACCOUNT, passphrase, strict)
+    }
+
+    /// Read the master passphrase, triggering the Touch ID prompt. Ok(None) = not
+    /// unlocked. When `strict`, attach a zero-reuse `LAContext` so this read forces a
+    /// fresh tap (no grace-window reuse).
+    pub fn read(_prompt: &str, strict: bool) -> Result<Option<String>, String> {
+        let _ctx; // must outlive SecItemCopyMatching
+        let ctx = if strict {
+            match auth_context(0.0) {
+                Some(c) => {
+                    _ctx = c;
+                    Some(&_ctx)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        read_account_with(ACCOUNT, ctx)
+    }
+
+    // ── Write-only inbox identity (AGENT_SECRET_LIFECYCLE.md) ──
+
+    /// Store the inbox age identity (UserPresence — opened only at merge with a tap).
+    /// Storing needs no tap; only reading does.
+    pub fn store_inbox_identity(secret: &str) -> Result<(), String> {
+        store_account(INBOX_ACCOUNT, secret, false)
+    }
+
+    /// Whether the inbox identity exists — WITHOUT triggering a Touch ID prompt
+    /// (returns attributes only, not the protected data). Lets `inbox init` /
+    /// `ensure_recipient` be idempotent and tap-free.
+    pub fn inbox_identity_exists() -> bool {
+        let mut pairs = base_query(INBOX_ACCOUNT);
+        pairs.push((unsafe { cfs(kSecReturnAttributes) }, CFBoolean::true_value().as_CFType()));
+        pairs.push((unsafe { cfs(kSecMatchLimit) }, CFNumber::from(1i64).as_CFType()));
+        let dict = CFDictionary::from_CFType_pairs(&pairs);
+        let mut result: CFTypeRef = ptr::null();
+        let status = unsafe { SecItemCopyMatching(dict.as_concrete_TypeRef(), &mut result) };
+        if !result.is_null() {
+            // Balance the +1 from a successful attributes return.
+            unsafe { CFType::wrap_under_create_rule(result) };
+        }
+        status == errSecSuccess
+    }
+
+    /// Read several accounts under ONE auth context, so a non-strict merge opens the
+    /// inbox identity + the vault master with a single Touch ID tap (the reuse window
+    /// carries the first auth to the rest). In `strict` mode the context is zero-reuse,
+    /// so each item still demands a fresh tap (by design). Returns one entry per
+    /// account, in order; `None` = that account isn't present.
+    pub fn read_accounts(accounts: &[&str], strict: bool) -> Result<Vec<Option<String>>, String> {
+        let _ctx; // must outlive every SecItemCopyMatching below
+        let ctx = match auth_context(if strict { 0.0 } else { 15.0 }) {
+            Some(c) => {
+                _ctx = c;
+                Some(&_ctx)
+            }
+            None => None,
+        };
+        let mut out = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            out.push(read_account_with(account, ctx)?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -200,6 +271,17 @@ mod imp {
     pub fn delete() -> Result<(), String> {
         Ok(())
     }
+    pub fn store_inbox_identity(_secret: &str) -> Result<(), String> {
+        Err("biometric Keychain is macOS-only".into())
+    }
+    pub fn inbox_identity_exists() -> bool {
+        false
+    }
+    pub fn read_accounts(_accounts: &[&str], _strict: bool) -> Result<Vec<Option<String>>, String> {
+        Ok(Vec::new())
+    }
 }
 
-pub use imp::{delete, read, store};
+pub use imp::{
+    delete, inbox_identity_exists, read, read_accounts, store, store_inbox_identity,
+};

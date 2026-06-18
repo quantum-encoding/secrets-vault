@@ -11,6 +11,7 @@ use secrets_vault::{is_valid_key, parse_env_lines, random_bytes, Vault, VaultErr
 
 mod backend;
 mod gsm;
+mod inbox;
 mod keychain;
 mod registry;
 
@@ -40,6 +41,10 @@ enum Commands {
         /// block (AWS / Vault / Doppler / 1Password / …) instead of the local vault.
         #[arg(long)]
         remote: bool,
+        /// Seal into the write-only inbox (no Touch ID) instead of the vault. Merge
+        /// later with one tap (`secrets inbox merge`). Local-vault only.
+        #[arg(long)]
+        inbox: bool,
     },
     /// Generate a random secret and store it — value is NEVER printed
     Gen {
@@ -61,6 +66,10 @@ enum Commands {
         /// block (AWS / Vault / Doppler / …) instead of the local vault.
         #[arg(long)]
         remote: bool,
+        /// Seal into the write-only inbox (no Touch ID) instead of the vault. Merge
+        /// later with one tap (`secrets inbox merge`). Local-vault only.
+        #[arg(long)]
+        inbox: bool,
     },
     /// Retrieve a secret (stdout, no trailing newline)
     Get {
@@ -126,6 +135,25 @@ enum Commands {
     Revoke { agent: String, project: String },
     /// List registered projects and agent grants (Touch ID gated)
     ListProjects,
+    /// Write-only inbox for agent-generated secrets (AGENT_SECRET_LIFECYCLE.md)
+    Inbox {
+        #[command(subcommand)]
+        sub: InboxCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum InboxCmd {
+    /// Generate the inbox keypair (identity → Keychain, recipient → inbox.pub).
+    /// Idempotent and tap-free; also lazy-runs on the first `--inbox` write.
+    Init,
+    /// Show pending entries — names + new/⚠overwrite (from the name index). No Touch ID.
+    List,
+    /// Open + merge all pending entries into the vault — ONE Touch ID tap. Wipes the
+    /// inbox; entries that fail to open stay behind. Overwrites are reported.
+    Merge,
+    /// Reject a pending entry by name (removes it without merging). No Touch ID.
+    Drop { name: String },
 }
 
 fn vault_path() -> std::path::PathBuf {
@@ -545,7 +573,7 @@ fn eval_warning() {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Set { key, value, project, gsm, remote } => {
+        Commands::Set { key, value, project, gsm, remote, inbox } => {
             if !is_valid_key(&key) {
                 eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
                 process::exit(1);
@@ -567,7 +595,23 @@ fn main() {
                 eprintln!("Error: empty value");
                 process::exit(1);
             }
-            if remote {
+            if inbox {
+                if gsm || remote {
+                    eprintln!("--inbox seals into the local vault inbox; not valid with --gsm/--remote.");
+                    process::exit(1);
+                }
+                let storage = scoped_key(&project, &key);
+                match inbox::append(&secrets_dir(), &storage, &value) {
+                    Ok(count) => eprintln!(
+                        "Sealed {storage} into the inbox ({count} pending) — no Touch ID. \
+                         Merge later: secrets inbox merge"
+                    ),
+                    Err(e) => {
+                        eprintln!("Inbox error: {e}");
+                        process::exit(1);
+                    }
+                }
+            } else if remote {
                 let be = manifest_backend().unwrap_or_else(|e| {
                     eprintln!("Error: {e}");
                     process::exit(1);
@@ -601,7 +645,7 @@ fn main() {
             }
         }
 
-        Commands::Gen { key, bytes, force, project, gsm, remote } => {
+        Commands::Gen { key, bytes, force, project, gsm, remote, inbox } => {
             if !is_valid_key(&key) {
                 eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
                 process::exit(1);
@@ -613,7 +657,26 @@ fn main() {
             // Random bytes → hex. The value is NEVER printed (no stdout, no
             // scrollback, no shell history): the agent only handles the name.
             let value = to_hex(&random_bytes(bytes));
-            if remote {
+            if inbox {
+                if gsm || remote {
+                    eprintln!("--inbox seals into the local vault inbox; not valid with --gsm/--remote.");
+                    process::exit(1);
+                }
+                // new-vs-overwrite is decided at merge against the unlocked vault, so
+                // --force is irrelevant here; the inbox always accepts the seal.
+                let _ = force;
+                let storage = scoped_key(&project, &key);
+                match inbox::append(&secrets_dir(), &storage, &value) {
+                    Ok(count) => eprintln!(
+                        "Generated {storage} ({bytes} bytes) → sealed into the inbox ({count} pending), \
+                         value never printed. Merge later: secrets inbox merge"
+                    ),
+                    Err(e) => {
+                        eprintln!("Inbox error: {e}");
+                        process::exit(1);
+                    }
+                }
+            } else if remote {
                 let be = manifest_backend().unwrap_or_else(|e| {
                     eprintln!("Error: {e}");
                     process::exit(1);
@@ -990,5 +1053,159 @@ fn main() {
             }
         }
 
+        Commands::Inbox { sub } => {
+            let dir = secrets_dir();
+            match sub {
+                InboxCmd::Init => match inbox::ensure_recipient(&dir) {
+                    Ok(_) => eprintln!(
+                        "Inbox ready — recipient at {} (identity in the Keychain).",
+                        inbox::pub_path(&dir).display()
+                    ),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        process::exit(1);
+                    }
+                },
+
+                InboxCmd::List => {
+                    let entries = inbox::read_entries(&dir).unwrap_or_default();
+                    if entries.is_empty() {
+                        eprintln!("Inbox empty — nothing pending.");
+                    } else {
+                        // new-vs-overwrite from the plaintext name index — no Touch ID.
+                        let index = read_index();
+                        eprintln!("{} pending (review, then `secrets inbox merge`):", entries.len());
+                        for e in &entries {
+                            let tag = if index.iter().any(|k| k == &e.name) {
+                                "⚠ OVERWRITE"
+                            } else {
+                                "new"
+                            };
+                            println!("  {}  [{tag}]", e.name);
+                        }
+                    }
+                }
+
+                InboxCmd::Drop { name } => match inbox::drop_entry(&dir, &name) {
+                    Ok(true) => eprintln!("Dropped pending '{name}'."),
+                    Ok(false) => {
+                        eprintln!("No pending entry named '{name}'.");
+                        process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        process::exit(1);
+                    }
+                },
+
+                InboxCmd::Merge => {
+                    let entries = match inbox::read_entries(&dir) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            process::exit(1);
+                        }
+                    };
+                    if entries.is_empty() {
+                        eprintln!("Inbox empty — nothing to merge.");
+                        return;
+                    }
+
+                    // ONE tap (non-strict): open the inbox identity + the vault master
+                    // under a single shared auth context. Strict mode → a fresh tap each.
+                    let vals = match keychain::read_accounts(
+                        &["inbox-identity", "vault-master"],
+                        is_strict_mode(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Keychain error: {e}");
+                            process::exit(1);
+                        }
+                    };
+
+                    let identity_str = match vals.first().cloned().flatten() {
+                        Some(s) => s,
+                        None => {
+                            eprintln!("Inbox identity not found — run `secrets inbox init` first.");
+                            process::exit(1);
+                        }
+                    };
+                    let identity: age::x25519::Identity = match identity_str.parse() {
+                        Ok(i) => i,
+                        Err(e) => {
+                            eprintln!("Corrupt inbox identity: {e}");
+                            process::exit(1);
+                        }
+                    };
+
+                    // Master: env override → the keychain read above.
+                    let master = match env::var("SECRETS_PASSPHRASE")
+                        .ok()
+                        .or_else(|| vals.get(1).cloned().flatten())
+                    {
+                        Some(m) => Zeroizing::new(m),
+                        None => {
+                            eprintln!("Vault is locked — run `secrets unlock` first.");
+                            process::exit(1);
+                        }
+                    };
+
+                    let mut vault = load_vault_with(master.as_str());
+                    let mut new_keys: Vec<String> = Vec::new();
+                    let mut overwrites: Vec<String> = Vec::new();
+                    let mut failed: Vec<(String, String)> = Vec::new();
+
+                    for e in &entries {
+                        match inbox::open(&identity, &e.sealed) {
+                            Ok(value) => {
+                                if vault.get(&e.name).is_some() {
+                                    overwrites.push(e.name.clone());
+                                } else {
+                                    new_keys.push(e.name.clone());
+                                }
+                                vault.set(e.name.clone(), value);
+                            }
+                            Err(err) => failed.push((e.name.clone(), err)),
+                        }
+                    }
+
+                    if new_keys.is_empty() && overwrites.is_empty() {
+                        eprintln!("Nothing merged — all entries failed to open:");
+                        for (n, err) in &failed {
+                            eprintln!("  ✗ {n}: {err}");
+                        }
+                        process::exit(1);
+                    }
+
+                    save_vault(&vault, master.as_str()); // also refreshes the name index
+
+                    // Keep only entries that failed to open; remove the merged ones.
+                    use std::collections::HashSet;
+                    let merged: HashSet<&String> =
+                        new_keys.iter().chain(overwrites.iter()).collect();
+                    let leftover: Vec<&inbox::Entry> =
+                        entries.iter().filter(|e| !merged.contains(&e.name)).collect();
+                    if let Err(e) = inbox::rewrite(&dir, &leftover) {
+                        eprintln!("(warning: could not rewrite inbox: {e})");
+                    }
+
+                    eprintln!(
+                        "Merged {} new + {} overwrite into the vault:",
+                        new_keys.len(),
+                        overwrites.len()
+                    );
+                    for n in &new_keys {
+                        eprintln!("  + {n} (new)");
+                    }
+                    for n in &overwrites {
+                        eprintln!("  ⚠ {n} (OVERWRITE)");
+                    }
+                    for (n, err) in &failed {
+                        eprintln!("  ✗ {n}: {err} (left in inbox)");
+                    }
+                }
+            }
+        }
     }
 }
