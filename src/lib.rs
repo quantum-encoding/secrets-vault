@@ -303,11 +303,15 @@ impl Drop for Vault {
 
 // ── Key validation ──
 
-/// Check if a key name is valid (alphanumeric + underscore, non-empty, ≤256 bytes).
+/// Check if a key name is valid: non-empty, ≤256 bytes, and `[A-Za-z0-9_-]` only.
+/// This is exactly Google Secret Manager's allowed secret-ID charset (hyphens are
+/// valid there; dots are NOT), so a key that validates here is storable in every
+/// backend — keychain account, HashMap key, and GSM secret ID alike. Hyphens matter
+/// in practice: many real-world secret names are kebab-case (e.g. `prod-db-password`).
 pub fn is_valid_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= MAX_KEY_LEN
-        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Check a project namespace is safe to use as a vault-key prefix: non-empty,
@@ -531,9 +535,12 @@ mod tests {
     fn valid_keys() {
         assert!(is_valid_key("API_KEY"));
         assert!(is_valid_key("key123"));
+        assert!(is_valid_key("prod-db-password"));   // kebab-case (GSM-valid)
+        assert!(is_valid_key("metatron-enterprise-lock"));
         assert!(!is_valid_key(""));
         assert!(!is_valid_key("has space"));
-        assert!(!is_valid_key("has-dash"));
+        assert!(!is_valid_key("has.dot"));           // dots are NOT GSM-valid
+        assert!(!is_valid_key("has/slash"));
     }
 
     #[test]

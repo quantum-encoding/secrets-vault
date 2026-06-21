@@ -427,7 +427,7 @@ fn read_index() -> Vec<String> {
 /// Validate key (+ project) and build the storage key: `project/KEY` or `KEY`.
 fn scoped_key(project: &Option<String>, key: &str) -> String {
     if !is_valid_key(key) {
-        eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
+        eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _, -)");
         process::exit(1);
     }
     match project {
@@ -575,7 +575,7 @@ fn main() {
     match cli.command {
         Commands::Set { key, value, project, gsm, remote, inbox } => {
             if !is_valid_key(&key) {
-                eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
+                eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _, -)");
                 process::exit(1);
             }
             let value = match value {
@@ -647,7 +647,7 @@ fn main() {
 
         Commands::Gen { key, bytes, force, project, gsm, remote, inbox } => {
             if !is_valid_key(&key) {
-                eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _)");
+                eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _, -)");
                 process::exit(1);
             }
             if bytes == 0 || bytes > 1024 {
