@@ -315,6 +315,111 @@ fn prompt_only_passphrase() -> Zeroizing<String> {
     }))
 }
 
+/// Read a secret value from an interactive TTY, echoing a bullet (•) per
+/// character so the typist sees the *length* accumulate — feedback the silent
+/// rpassword prompt never gave. The value itself is never echoed. Handles
+/// Backspace/Delete (erase one char), Enter (submit), Ctrl-C (abort 130),
+/// Ctrl-D (submit what's typed). Falls back to the silent prompt when stdin
+/// isn't a real terminal or raw mode can't be entered, so piped/redirected
+/// callers are unaffected.
+///
+/// macOS-only raw path (libc is a macOS-target dep here for sysctl); other
+/// platforms keep the silent prompt.
+#[cfg(target_os = "macos")]
+fn read_masked(prompt: &str) -> String {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    // Only drive raw mode on an interactive terminal; else defer to rpassword.
+    if !atty::is(atty::Stream::Stdin) {
+        return prompt_password(prompt).unwrap_or_default();
+    }
+    let fd = io::stdin().as_raw_fd();
+
+    let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
+        return prompt_password(prompt).unwrap_or_default();
+    }
+    let mut raw = orig; // libc::termios is Copy — `orig` stays valid for restore
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        return prompt_password(prompt).unwrap_or_default();
+    }
+
+    // RAII: restore the terminal on every *normal* exit path (return / panic
+    // unwind). Ctrl-C uses process::exit, which skips Drop, so that arm
+    // restores explicitly before exiting.
+    struct TermGuard {
+        fd: libc::c_int,
+        orig: libc::termios,
+    }
+    impl Drop for TermGuard {
+        fn drop(&mut self) {
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
+        }
+    }
+    let _guard = TermGuard { fd, orig };
+
+    let mut err = io::stderr();
+    let _ = write!(err, "{prompt}");
+    let _ = err.flush();
+
+    // Zeroizing so the plaintext buffer is wiped on drop.
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    let mut byte = [0u8; 1];
+    loop {
+        let n = unsafe { libc::read(fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n <= 0 {
+            break; // EOF / read error
+        }
+        match byte[0] {
+            b'\n' | b'\r' => {
+                let _ = write!(err, "\r\n");
+                let _ = err.flush();
+                break;
+            }
+            3 => {
+                // Ctrl-C: restore the terminal ourselves (exit skips Drop), then abort.
+                unsafe { libc::tcsetattr(fd, libc::TCSANOW, &orig) };
+                let _ = write!(err, "\r\n");
+                let _ = err.flush();
+                process::exit(130);
+            }
+            4 => break, // Ctrl-D: submit what's been typed so far
+            0x7f | 0x08 => {
+                // Backspace/Delete: drop one whole UTF-8 char, erase one bullet.
+                if !buf.is_empty() {
+                    while let Some(&b) = buf.last() {
+                        buf.pop();
+                        if (b & 0xC0) != 0x80 {
+                            break; // stopped at the lead byte
+                        }
+                    }
+                    let _ = write!(err, "\x08 \x08");
+                    let _ = err.flush();
+                }
+            }
+            b => {
+                buf.push(b);
+                // One bullet per character: skip UTF-8 continuation bytes.
+                if (b & 0xC0) != 0x80 {
+                    let _ = write!(err, "•");
+                    let _ = err.flush();
+                }
+            }
+        }
+    }
+    // `_guard` drops here → terminal restored.
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_masked(prompt: &str) -> String {
+    prompt_password(prompt).unwrap_or_default()
+}
+
 fn load_vault() -> (Vault, Zeroizing<String>) {
     let path = vault_path();
     let passphrase = get_passphrase();
@@ -586,8 +691,7 @@ fn main() {
                         io::stdin().read_line(&mut buf).expect("Failed to read stdin");
                         buf.trim_end_matches('\n').to_string()
                     } else {
-                        prompt_password(format!("Enter value for {key}: "))
-                            .expect("Failed to read value")
+                        read_masked(&format!("Enter value for {key}: "))
                     }
                 }
             };
