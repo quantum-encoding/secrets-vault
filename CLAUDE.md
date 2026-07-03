@@ -37,6 +37,7 @@ These are the whole point of the tool — an agent that breaks them defeats it:
 ```bash
 secrets set  KEY               # interactive TTY: masked prompt, shows • per char, never echoes
 echo -n v | secrets set KEY    # non-TTY: value read from stdin automatically (not argv)
+echo -n v | secrets set KEY --stdin  # explicit stdin read (errors if a positional value is also given)
 secrets gen  KEY [--bytes 64]  # generate random secret; value NEVER printed
 secrets get  KEY               # read to stdout — pipe to a consumer, don't echo
 secrets has  KEY               # existence check, NO Touch ID (reads the plaintext name index)
@@ -106,6 +107,19 @@ cargo build --release && ./sign.sh && cp target/release/secrets ~/.local/bin/sec
 so previously-stored items stay reachable — re-signing is safe and does not orphan the vault.
 Verify no regression after installing with `secrets has SOME_KEY` (no tap) then
 `secrets get SOME_KEY | wc -c` (Touch ID — proves the new signature can still reach the key).
+
+### Testing the masked prompt
+
+`tests/masked_set.sh` drives the interactive `set` prompt over a PTY (via `expect`)
+against a **throwaway vault** (`SECRETS_DIR` + `SECRETS_PASSPHRASE`, no Touch ID). It
+asserts (1) the plaintext value is never echoed and (2) a typed value with a mid-word
+Backspace edit round-trips byte-for-byte. Run after touching `read_masked`:
+
+```bash
+cargo build --release && tests/masked_set.sh
+```
+
+Skips cleanly if `expect` isn't installed.
 
 ### Source map
 

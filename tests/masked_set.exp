@@ -1,0 +1,32 @@
+#!/usr/bin/env expect
+# Drive the interactive masked `secrets set` prompt over a PTY and assert the
+# plaintext value is NEVER echoed to the terminal (only bullets are). Invoked by
+# tests/masked_set.sh, which sets SECRETS_BIN + a throwaway SECRETS_DIR /
+# SECRETS_PASSPHRASE (no Touch ID). The value-capture correctness (incl. the
+# backspace edit) is asserted by the round-trip `get` back in the shell wrapper.
+set timeout 15
+if {![info exists env(SECRETS_BIN)]} { puts "FAIL: SECRETS_BIN unset"; exit 2 }
+set bin $env(SECRETS_BIN)
+
+spawn $bin set MASKED_TEST
+expect {
+  -re {Enter value for MASKED_TEST} {}
+  timeout { puts "FAIL: never saw the value prompt"; exit 1 }
+  eof     { puts "FAIL: process exited before the prompt"; exit 1 }
+}
+
+# Type "topX", press Backspace/Delete (\177 → drops the X), then "-secret".
+# The masked reader should capture "top-secret" while showing only bullets.
+send -- "topX"
+send -- "\177"
+send -- "-secret"
+send -- "\r"
+
+expect eof
+set shown $expect_out(buffer)
+if {[string first "top-secret" $shown] >= 0} {
+  puts "FAIL: plaintext value was echoed to the terminal — masking is broken"
+  exit 1
+}
+puts "OK: interactive value not echoed (masked)"
+exit 0

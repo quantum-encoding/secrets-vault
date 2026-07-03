@@ -31,6 +31,11 @@ enum Commands {
     Set {
         key: String,
         value: Option<String>,
+        /// Read the value from stdin (explicit; a piped/redirected stdin is
+        /// also auto-detected without this flag). Errors if a positional
+        /// value is also given.
+        #[arg(long, conflicts_with = "value")]
+        stdin: bool,
         /// Namespace under a project (stored internally as project/KEY)
         #[arg(long, short)]
         project: Option<String>,
@@ -678,7 +683,7 @@ fn eval_warning() {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Set { key, value, project, gsm, remote, inbox } => {
+        Commands::Set { key, value, stdin, project, gsm, remote, inbox } => {
             if !is_valid_key(&key) {
                 eprintln!("Invalid key: '{key}' (use A-Z, 0-9, _, -)");
                 process::exit(1);
@@ -686,7 +691,10 @@ fn main() {
             let value = match value {
                 Some(v) => v,
                 None => {
-                    if atty::isnt(atty::Stream::Stdin) {
+                    // Explicit --stdin, or an auto-detected non-TTY stdin, reads
+                    // the value from stdin (never argv). An interactive TTY gets
+                    // the masked prompt (bullets show length; value never echoed).
+                    if stdin || atty::isnt(atty::Stream::Stdin) {
                         let mut buf = String::new();
                         io::stdin().read_line(&mut buf).expect("Failed to read stdin");
                         buf.trim_end_matches('\n').to_string()
