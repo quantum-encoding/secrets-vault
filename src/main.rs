@@ -695,9 +695,17 @@ fn main() {
                     // the value from stdin (never argv). An interactive TTY gets
                     // the masked prompt (bullets show length; value never echoed).
                     if stdin || atty::isnt(atty::Stream::Stdin) {
+                        // Read the ENTIRE payload to EOF. Multi-line values (e.g. a
+                        // pretty-printed JSON service-account key) must NOT be
+                        // truncated at the first newline — read_line did exactly
+                        // that, storing only `{`. Strip a single trailing newline so
+                        // the common `echo secret | secrets set` case stores `secret`
+                        // (not `secret\n`); internal newlines are preserved verbatim.
                         let mut buf = String::new();
-                        io::stdin().read_line(&mut buf).expect("Failed to read stdin");
-                        buf.trim_end_matches('\n').to_string()
+                        io::stdin().read_to_string(&mut buf).expect("Failed to read stdin");
+                        let trimmed = buf.strip_suffix('\n').unwrap_or(&buf);
+                        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+                        trimmed.to_string()
                     } else {
                         read_masked(&format!("Enter value for {key}: "))
                     }
@@ -908,8 +916,19 @@ fn main() {
         }
 
         Commands::Export => {
+            // The KEY=VALUE line format is newline-delimited, so it cannot faithfully
+            // carry a value that itself contains newlines (a multi-line JSON key would
+            // be split across physical lines and `import` — which parses line-by-line —
+            // would only recover the first fragment). Rather than silently corrupt such
+            // a value, warn loudly to stderr (stdout stays clean for redirection).
             let (vault, _) = load_vault();
             for (key, value) in vault.iter() {
+                if value.contains('\n') {
+                    eprintln!(
+                        "warning: '{key}' is multi-line; the KEY=VALUE export format cannot \
+                         round-trip it via `import`. Use `secrets get {key}` to retrieve it intact."
+                    );
+                }
                 println!("{key}={value}");
             }
         }
