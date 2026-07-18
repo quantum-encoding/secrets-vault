@@ -51,6 +51,17 @@ mod imp {
         fn objc_msgSend();
     }
 
+    // `kSecUseOperationPrompt` sets the custom reason line the OS Touch ID sheet
+    // shows for a keychain read. security-framework-sys doesn't re-export it, but
+    // it's a stable Security.framework CFString symbol — declare it directly.
+    // Deprecated by Apple in favor of pre-evaluating an LAContext, but still honored
+    // and works mode-independently (no context required), which is what we want so
+    // the enriched prompt surfaces on BOTH strict and non-strict reads.
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecUseOperationPrompt: CFStringRef;
+    }
+
     /// Build an `LAContext` with `touchIDAuthenticationAllowableReuseDuration = reuse`.
     /// `0.0` forces a FRESH Touch ID tap with no grace (strict reads). A non-zero
     /// value lets back-to-back reads under the SAME context share one tap — used by
@@ -156,14 +167,26 @@ mod imp {
 
     /// Read one account's secret, attaching an optional shared auth context. The
     /// `_ctx` must outlive the call; pass it in so several reads can share one tap.
-    fn read_account_with(account: &str, ctx: Option<&CFType>) -> Result<Option<String>, String> {
+    fn read_account_with(
+        account: &str,
+        ctx: Option<&CFType>,
+        prompt: Option<&str>,
+    ) -> Result<Option<String>, String> {
         let mut pairs = base_query(account);
         pairs.push((unsafe { cfs(kSecReturnData) }, CFBoolean::true_value().as_CFType()));
         // kSecMatchLimit accepts a count CFNumber (the crate doesn't export the
-        // kSecMatchLimitOne string constant). The OS shows its default biometric prompt.
+        // kSecMatchLimitOne string constant).
         pairs.push((unsafe { cfs(kSecMatchLimit) }, CFNumber::from(1i64).as_CFType()));
         if let Some(ctx) = ctx {
             pairs.push((unsafe { cfs(kSecUseAuthenticationContext) }, ctx.clone()));
+        }
+        // Custom reason line on the OS Touch ID sheet — "read DATABASE_URL for
+        // 'promeasure' (agent claude)…" instead of the generic system default.
+        if let Some(prompt) = prompt.filter(|p| !p.is_empty()) {
+            pairs.push((
+                unsafe { cfs(kSecUseOperationPrompt) },
+                CFString::new(prompt).as_CFType(),
+            ));
         }
 
         let dict = CFDictionary::from_CFType_pairs(&pairs);
@@ -197,7 +220,7 @@ mod imp {
     /// Read the master passphrase, triggering the Touch ID prompt. Ok(None) = not
     /// unlocked. When `strict`, attach a zero-reuse `LAContext` so this read forces a
     /// fresh tap (no grace-window reuse).
-    pub fn read(_prompt: &str, strict: bool) -> Result<Option<String>, String> {
+    pub fn read(prompt: &str, strict: bool) -> Result<Option<String>, String> {
         let _ctx; // must outlive SecItemCopyMatching
         let ctx = if strict {
             match auth_context(0.0) {
@@ -210,7 +233,7 @@ mod imp {
         } else {
             None
         };
-        read_account_with(ACCOUNT, ctx)
+        read_account_with(ACCOUNT, ctx, Some(prompt))
     }
 
     // ── Write-only inbox identity (AGENT_SECRET_LIFECYCLE.md) ──
@@ -254,7 +277,7 @@ mod imp {
         };
         let mut out = Vec::with_capacity(accounts.len());
         for account in accounts {
-            out.push(read_account_with(account, ctx)?);
+            out.push(read_account_with(account, ctx, None)?);
         }
         Ok(out)
     }

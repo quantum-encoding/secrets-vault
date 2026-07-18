@@ -60,9 +60,17 @@ When approval is needed, the CLI writes `<id>.json` into the handshake dir, wher
   "agent":   "claude",                      // resolved calling agent
   "project": "metatron-cloud-prod-v1",      // target project
   "command": "cargo",                       // child command (argv[0])
-  "keys":    ["DATABASE_URL", "API_KEY"]    // requested secret names
+  "keys":    ["DATABASE_URL", "API_KEY"],   // requested secret names
+  "reason":  "deploy staging build"         // OPTIONAL — `secrets exec --reason`;
+                                            // omitted from the wire when not given
 }
 ```
+
+`reason` is a human justification shown on the aiconductor consent slab (and folded
+into the OS Touch ID sheet's reason line) so the approver sees *why*, not just a bare
+biometric scan. It is display-only intent, never an authorization input — the grant
+still comes only from the human's biometric via the encrypted registry. Absent ⇒ the
+prompt still shows agent/project/command/keys.
 
 The CLI then blocks, polling every **100 ms** for `<id>_response.json`, up to a
 **30 s** timeout (override `$SECRETS_APPROVAL_TIMEOUT_SECS`). On timeout it deletes

@@ -124,6 +124,12 @@ enum Commands {
     Exec {
         /// Project name — selects the secret list from .secrets.toml
         project: String,
+        /// Human justification shown on the approval prompt ("why do you need this?").
+        /// Surfaces on the Touch ID sheet and the aiconductor consent slab so the
+        /// approver sees intent, not just a bare biometric scan. Optional; when
+        /// omitted the prompt still shows agent/project/keys/command.
+        #[arg(long)]
+        reason: Option<String>,
         /// Command and arguments (everything after `--`)
         #[arg(last = true)]
         command: Vec<String>,
@@ -290,10 +296,18 @@ fn is_strict_mode() -> bool {
 }
 
 fn get_passphrase() -> Zeroizing<String> {
+    get_passphrase_prompted("Unlock your secrets vault")
+}
+
+/// Like `get_passphrase`, but with a custom reason line for the OS Touch ID sheet —
+/// so an `exec` can show "read DATABASE_URL for 'promeasure' (agent claude)…" instead
+/// of the generic default. The string is display-only; the keychain ACL is the real
+/// enforcement. Values never leave this function.
+fn get_passphrase_prompted(prompt: &str) -> Zeroizing<String> {
     if let Ok(pass) = env::var("SECRETS_PASSPHRASE") {
         return Zeroizing::new(pass);
     }
-    match keychain::read("Unlock your secrets vault", is_strict_mode()) {
+    match keychain::read(prompt, is_strict_mode()) {
         Ok(Some(p)) => return Zeroizing::new(p),
         Ok(None) => {} // no Keychain item yet (run `secrets unlock`)
         Err(e) => eprintln!("(keychain unavailable: {e})"),
@@ -306,6 +320,28 @@ fn get_passphrase() -> Zeroizing<String> {
     eprintln!("Run `secrets unlock` once (stores the master key behind Touch ID); after");
     eprintln!("that the Touch ID sheet surfaces even from a headless agent invocation.");
     process::exit(1);
+}
+
+/// Build the reason line shown on the OS Touch ID sheet for an `exec` unlock.
+/// Always names the keys + project (the "what"); adds the agent (the "who") and the
+/// human `--reason` (the "why") when known. This is the enrichment that turns the
+/// "basic" bare biometric popup into something the human can actually judge.
+fn exec_prompt(project: &str, keys: &[String], agent: Option<&str>, reason: Option<&str>) -> String {
+    let key_list = if keys.is_empty() {
+        "secrets".to_string()
+    } else if keys.len() <= 4 {
+        keys.join(", ")
+    } else {
+        format!("{} +{} more", keys[..4].join(", "), keys.len() - 4)
+    };
+    let mut s = format!("Unlock {key_list} for project “{project}”");
+    if let Some(a) = agent {
+        s.push_str(&format!(" — requested by {a}"));
+    }
+    if let Some(r) = reason.filter(|r| !r.is_empty()) {
+        s.push_str(&format!("\nReason: {r}"));
+    }
+    s
 }
 
 /// Passphrase from env or a TTY prompt only — never the Keychain. Used by
@@ -608,6 +644,7 @@ fn ipc_approval(
     project: &str,
     command: &str,
     keys: &[String],
+    reason: Option<&str>,
     reg_dir: &Path,
     passphrase: &str,
 ) -> bool {
@@ -626,9 +663,14 @@ fn ipc_approval(
     let req_path = dir.join(format!("{id}.json"));
     let resp_path = dir.join(format!("{id}_response.json"));
 
-    let req = serde_json::json!({
+    let mut req = serde_json::json!({
         "id": id, "agent": agent, "project": project, "command": command, "keys": keys,
     });
+    // Human justification (`--reason`), shown on the aiconductor consent slab. Omitted
+    // from the wire when absent so the field only appears when there's a real reason.
+    if let Some(r) = reason.filter(|r| !r.is_empty()) {
+        req["reason"] = serde_json::Value::String(r.to_string());
+    }
     if fs::write(&req_path, serde_json::to_vec_pretty(&req).unwrap_or_default()).is_err() {
         eprintln!("Could not write approval request.");
         return false;
@@ -980,7 +1022,7 @@ fn main() {
             }
         },
 
-        Commands::Exec { project, command } => {
+        Commands::Exec { project, reason, command } => {
             if command.is_empty() {
                 eprintln!("Usage: secrets exec <project> -- <command> [args...]");
                 process::exit(2);
@@ -994,10 +1036,16 @@ fn main() {
                 process::exit(1);
             });
 
+            // Resolve the calling agent up front — it feeds both the enriched Touch ID
+            // prompt (the "who") and the approval enforcement below.
+            let agent = registry::resolve_agent();
+
             // One Touch ID: get the passphrase once (native sheet surfaces even
             // headless), reuse for BOTH the registry and the whole-batch vault
-            // decrypt — no second prompt.
-            let pass = get_passphrase();
+            // decrypt — no second prompt. The sheet now names the keys/project/agent
+            // and the human --reason instead of a bare "authenticate" default.
+            let prompt = exec_prompt(&project, &names, agent.as_deref(), reason.as_deref());
+            let pass = get_passphrase_prompted(&prompt);
             let dir = secrets_dir();
             let reg = registry::Registry::load(&dir, &pass).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
@@ -1009,9 +1057,11 @@ fn main() {
             // anchored, NOT the forgeable response file). The request it sends lists
             // the ENTIRE key batch, so the human reviews/authorizes all of it in one
             // consent. A human / unrecognized operator who satisfied Touch ID proceeds.
-            if let Some(agent) = registry::resolve_agent() {
+            if let Some(agent) = agent {
                 if reg.grant_for(&agent, &project, registry::now()).is_none()
-                    && !ipc_approval(&agent, &project, &command[0], &names, &dir, &pass)
+                    && !ipc_approval(
+                        &agent, &project, &command[0], &names, reason.as_deref(), &dir, &pass,
+                    )
                 {
                     eprintln!("'{agent}' was not granted access to '{project}'.");
                     eprintln!("Or pre-authorize out-of-band:  secrets authorize {agent} {project}");
