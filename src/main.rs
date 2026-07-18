@@ -14,6 +14,7 @@ mod gsm;
 mod inbox;
 mod keychain;
 mod registry;
+mod session;
 
 use backend::Backend;
 
@@ -119,6 +120,21 @@ enum Commands {
     },
     /// Remove the biometric Keychain entry (re-lock)
     Lock,
+    /// Start a session-unlock broker: ONE Touch ID, then `secrets exec` runs
+    /// tap-free for the lifetime (ssh-agent model). For unattended drains —
+    /// the passphrase stays in the broker's memory, never in a child env.
+    Session {
+        /// Broker lifetime in minutes (it self-terminates after this).
+        #[arg(default_value = "60")]
+        minutes: u64,
+    },
+    /// INTERNAL: the detached session-broker serve loop. Reads the passphrase
+    /// from stdin (a pipe — never argv/env) and serves it on the socket. Not
+    /// for direct use; `secrets session` spawns it.
+    #[command(hide = true, name = "__session-serve")]
+    SessionServe {
+        minutes: u64,
+    },
     /// Run a command with ONLY a project's secrets in its environment.
     ///   secrets exec <project> -- <command> [args...]
     Exec {
@@ -306,6 +322,11 @@ fn get_passphrase() -> Zeroizing<String> {
 fn get_passphrase_prompted(prompt: &str) -> Zeroizing<String> {
     if let Ok(pass) = env::var("SECRETS_PASSPHRASE") {
         return Zeroizing::new(pass);
+    }
+    // Session broker (ssh-agent model): a live same-user daemon answers tap-free.
+    // Absent/expired → None, fall through to the Touch ID Keychain read.
+    if let Some(pass) = session::request_passphrase(&secrets_dir()) {
+        return pass;
     }
     match keychain::read(prompt, is_strict_mode()) {
         Ok(Some(p)) => return Zeroizing::new(p),
@@ -1014,6 +1035,7 @@ fn main() {
         Commands::Lock => match keychain::delete() {
             Ok(()) => {
                 let _ = fs::remove_file(strict_marker_path());
+                session::end(&secrets_dir());   // also kill any live session broker
                 eprintln!("Locked. Biometric Keychain entry removed.");
             }
             Err(e) => {
@@ -1021,6 +1043,64 @@ fn main() {
                 process::exit(1);
             }
         },
+
+        Commands::Session { minutes } => {
+            // ONE Touch ID here (the Keychain read), then hand the passphrase to
+            // a detached broker over a pipe. Verify it decrypts before starting a
+            // broker that would serve a wrong key.
+            let pass = get_passphrase_prompted("Start a secrets session (unattended drain)");
+            if let Ok(data) = fs::read(vault_path()) {
+                if Vault::decrypt(&data, &pass).is_err() {
+                    eprintln!("Wrong passphrase — session not started.");
+                    process::exit(1);
+                }
+            }
+            // Spawn the detached serve loop; pass the secret via its stdin (pipe),
+            // never argv/env. The child re-execs THIS binary's hidden subcommand.
+            let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("secrets"));
+            let mut child = process::Command::new(exe)
+                .arg("__session-serve")
+                .arg(minutes.to_string())
+                .stdin(process::Stdio::piped())
+                .stdout(process::Stdio::null())
+                .stderr(process::Stdio::null())
+                .spawn()
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to start session broker: {e}");
+                    process::exit(1);
+                });
+            if let Some(mut sin) = child.stdin.take() {
+                use std::io::Write as _;
+                let _ = sin.write_all(pass.as_bytes());
+                // dropping sin closes the pipe → the child stops reading
+            }
+            // Detach so the broker isn't reaped when this parent (and its shell)
+            // exits. We don't wait on it.
+            eprintln!(
+                "Session started — `secrets exec` runs tap-free for {minutes} min. \
+                 `secrets lock` ends it early."
+            );
+        }
+
+        Commands::SessionServe { minutes } => {
+            // Detached broker child. Read the passphrase from stdin (the pipe the
+            // parent wrote), then serve it on the socket until expiry/END.
+            use std::io::Read as _;
+            let mut pass = String::new();
+            if std::io::stdin().read_to_string(&mut pass).is_err() {
+                process::exit(1);
+            }
+            let pass = Zeroizing::new(pass);
+            if pass.is_empty() {
+                process::exit(1);
+            }
+            session::detach();
+            if let Err(e) = session::serve(&secrets_dir(), minutes, pass) {
+                eprintln!("session broker: {e}");
+                process::exit(1);
+            }
+            return;
+        }
 
         Commands::Exec { project, reason, command } => {
             if command.is_empty() {
