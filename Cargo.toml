@@ -52,7 +52,12 @@ cli = ["dep:clap", "dep:rpassword", "dep:dirs", "dep:atty", "dep:toml", "dep:ser
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 security-framework-sys = { version = "2.12", features = ["OSX_10_15"] }
-libc = "0.2"   # process-ancestry agent resolution (sysctl KERN_PROC)
+
+# The session-unlock broker (session.rs: setsid/fork daemon) is a Unix
+# feature, not macOS-only — libc must cover Linux too, not just the macOS
+# sysctl KERN_PROC ancestry path.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"
