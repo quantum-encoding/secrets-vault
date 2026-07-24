@@ -1,5 +1,12 @@
 # CLAUDE.md — `secrets` vault CLI
 
+> **⚠️ SUPERSEDED (Jul 2026): active development moved to
+> `~/work/rust_programs/secrets_cli_v2`** (`quantum-encoding/secrets_cli_v2`, private) —
+> the QVLT v2 implementation: per-entry encryption (reads decrypt ONLY the requested
+> key), splice writes, and a key-server session broker. The installed
+> `~/.local/bin/secrets` is v2 and the real vault has been migrated. Make CLI changes
+> THERE, not here. This repo remains as the v1 history + the QVLT2_SPEC.md draft.
+
 Guidance for AI agents (Claude Code and others) both **using** `secrets` to handle
 credentials and **modifying** this CLI. `secrets` is a Developer-ID-signed Rust CLI
 that replaces plaintext `export KEY=…` dotfiles with an AES-256-GCM vault whose master
